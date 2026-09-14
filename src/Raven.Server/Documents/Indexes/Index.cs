@@ -3413,6 +3413,8 @@ namespace Raven.Server.Documents.Indexes
 
             QueryRunner.AssertValidQuery(query, resultToFill);
 
+            AssertQueryDoesNotUseNonIndexedFields(query);
+
             using (var marker = MarkQueryAsRunning(query))
             {
                 var queryDuration = Stopwatch.StartNew();
@@ -3679,6 +3681,8 @@ namespace Raven.Server.Documents.Indexes
             QueryInternalPreparation(query);
 
             QueryRunner.AssertValidQuery(query, resultToFill);
+
+            AssertQueryDoesNotUseNonIndexedFields(query);
 
             using (var marker = MarkQueryAsRunning(query))
             {
@@ -3996,6 +4000,22 @@ namespace Raven.Server.Documents.Indexes
             using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction))
             {
                 return reader.GetEntriesFields(unknownTypeStaticFields);
+            }
+        }
+
+        // both search engines need terms to match and to order by, so a field that carries none has to be rejected here
+        private void AssertQueryDoesNotUseNonIndexedFields(IndexQueryServerSide query)
+        {
+            foreach (var field in query.Metadata.IndexFieldNames)
+                QueryBuilderHelper.AssertFieldIsIndexed(field.Value, this);
+
+            if (query.Metadata.OrderBy == null)
+                return;
+
+            foreach (var field in query.Metadata.OrderBy)
+            {
+                if (field.Name is not null) // score() and random() order by no field at all
+                    QueryBuilderHelper.AssertFieldIsIndexed(field.Name.Value, this);
             }
         }
 
