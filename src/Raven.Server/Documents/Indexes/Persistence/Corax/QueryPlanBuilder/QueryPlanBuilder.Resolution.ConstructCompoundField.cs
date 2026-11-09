@@ -140,6 +140,6 @@ internal static partial class QueryPlanBuilder
             directScan.Reason = $"entries_to_scan({entriesToScan}) × {QueryPrimitives.EntryScanCostMultiplier} < bitmap_cost({bitmapCost})";
         }
 
-        string FormatPredicates(ScanPredicateInfo[] cfr) => string.Join(", ", Array.ConvertAll(cfr, p => $"{p.FieldName} {p.CompareOp.ToOperator()}"));
+        string FormatPredicates(ScanPredicateInfo[] cfr) => string.Join(", ", Array.ConvertAll(cfr, p => $"{(p.Negated ? "not " : "")}{p.FieldName} {p.CompareOp.ToOperator()}"));
     }
 }

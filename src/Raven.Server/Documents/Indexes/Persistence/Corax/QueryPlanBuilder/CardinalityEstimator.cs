@@ -10,6 +10,42 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax.QueryPlanBuilder;
 
 internal static class CardinalityEstimator
 {
+    // How many entries pass the clause. Estimate sizes a negated clause by the operand it removes, the work the bitmap does,
+    // except NotEquals, which is already estimated as its complement.
+    public static long EstimatePassing(ClauseExecution e, long numberOfEntries)
+    {
+        RuntimeHelpers.EnsureSufficientExecutionStack();
+        if (e.IsNegated && e.ClauseType != ClauseType.NotEquals)
+        {
+            // The complement is a lower bound only of an operand estimated from above. A group may hold a negation, a sampled range is
+            // extrapolated, and a null IN value or a 'NULL' bound adds the null posting list the estimate leaves out, so these count
+            // one entry, as does an empty complement: the gates read 0 as no estimate.
+            bool unbounded = e.ClauseType is ClauseType.OrGroup or ClauseType.AndGroup || e.RangeEstimate is { IsExact: false } || e.HasNullTerm ||
+                             e.SentinelRewriteType == ClauseType.GreaterThanOrEqual;
+            return unbounded ? 1 : Math.Max(1, numberOfEntries - e.Cardinality);
+        }
+
+        switch (e.ClauseType)
+        {
+            case ClauseType.MatchAll:
+                return numberOfEntries;
+            case ClauseType.MatchNothing:
+                return 0;
+            case ClauseType.OrGroup:
+            case ClauseType.AndGroup:
+                bool isOr = e.ClauseType == ClauseType.OrGroup;
+                long passing = isOr ? 0 : numberOfEntries;
+                foreach (ClauseExecution sub in e.SubExecutions)
+                {
+                    long subPassing = EstimatePassing(sub, numberOfEntries);
+                    passing = isOr ? passing + subPassing : Math.Min(passing, subPassing);
+                }
+                return Math.Min(passing, numberOfEntries);
+            default:
+                return e.Cardinality;
+        }
+    }
+
     public static long Estimate(ClauseExecution exec, IndexSearcher indexSearcher, ValueWriter writer, ResolutionContext walkerCtx)
     {
         return EstimateClause(exec);

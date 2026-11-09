@@ -96,13 +96,10 @@ public sealed unsafe class SortedDrivingMatch : IQueryMatch, IDisposable
     }
 
     /// <summary>
-    /// Compound-driven variant — serves a query like
-    /// <c>FROM Orders WHERE Company = 'companies/1' ORDER BY OrderedAt</c> on a compound (Company, OrderedAt) index.
-    /// The provider walks the compound subtree for the pinned first field, so it already yields the second field in
-    /// order within that prefix.
-    /// 
-    /// The planner rejects scans when the field has null / missing values and the null sort mode isn't a match to the
-    /// physically sorted layout and falls back to bitmap + SortingMatch.
+    /// Driven variant — merges no null or non-existing posting list, so it yields only the entries of the provider's terms. A range or
+    /// equality on the sort field matches neither null nor missing values; the compound subtree of a pinned first field holds them in its
+    /// key with an empty field2, which a field2 range skips by its id, and without a field2 range TryCreateCompoundFieldMatch leaves the
+    /// walk to the bitmap while the sort field has null or missing values.
     /// </summary>
     public SortedDrivingMatch(ITermsProvider provider, LowLevelTransaction llt, ByteStringContext allocator)
     {
@@ -112,7 +109,7 @@ public sealed unsafe class SortedDrivingMatch : IQueryMatch, IDisposable
         _nullFirst = false;
         _emittedBitmap = new RoaringBitmap(allocator);
 
-        // No global null / non-existing merge for the compound-scoped scan (see summary).
+        // No global null / non-existing merge for a driven scan (see summary).
         _hasNullPostingList = false;
         _nullExhausted = true;
         _hasNonExistingPostingList = false;

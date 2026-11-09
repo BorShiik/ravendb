@@ -275,6 +275,8 @@ internal static partial class QueryPlanBuilder
         if (predicate.SubPredicates != null)
         {
             var groupNode = new QueryInspectionNode(predicate.Group == GroupKind.Or ? QueryPlanGraph.ResidualOrGroupOp : QueryPlanGraph.ResidualAndGroupOp);
+            if (predicate.Negated)
+                groupNode.Parameters["Negated"] = "true";
             foreach (var sub in predicate.SubPredicates)
                 groupNode.Children.Add(BuildScanPredicateNode(sub));
             return groupNode;

@@ -109,11 +109,6 @@ public partial class IndexSearcher
 
         long terms = forward.EstimateTermCountInRange();
         breakdown.RangeTerms = terms;
-        if (terms == 0)
-        {
-            breakdown.IsExact = true;
-            return 0;
-        }
 
         // Scan the bottom of the range. If we never hit the cap, we have walked every in-range term: the count is exact.
         RangePostingStats bottom = forward.CountPostingsInRange(RangeBottomSample);
@@ -132,13 +127,12 @@ public partial class IndexSearcher
         int topCap = (int)Math.Min(RangeTopSample, Math.Max(0, terms - bottom.Terms));
         if (topCap == 0)
         {
-            long exact = Math.Min(bottom.Postings, NumberOfEntries);
-            breakdown.IsExact = true;
+            long sampled = Math.Min(bottom.Postings, NumberOfEntries);
             breakdown.SampledTerms = bottom.Terms;
             breakdown.SampledPostings = bottom.Postings;
-            breakdown.RawEstimate = exact;
-            breakdown.Estimate = exact;
-            return exact;
+            breakdown.RawEstimate = sampled;
+            breakdown.Estimate = sampled;
+            return sampled;
         }
 
         var backward = BetweenAggregation(field, low, high, leftSide, rightSide, forward: false);

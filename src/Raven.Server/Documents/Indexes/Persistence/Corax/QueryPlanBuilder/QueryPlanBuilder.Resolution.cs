@@ -574,7 +574,7 @@ internal static partial class QueryPlanBuilder
 
         if (ctx.Exec.Plan.CompoundFieldResidualSet is null)
         {
-            rejectReason = "a filter can't be checked per-document during the scan";
+            rejectReason = "a filter isn't checked per-document by this scan";
             return false;
         }
 
@@ -795,7 +795,7 @@ internal static partial class QueryPlanBuilder
     }
 
     private static IQueryMatch BuildSortedDrivingWithTieBreakMatch(InstantiateContext ctx, ITermsProvider provider, LowLevelTransaction llt, NullsSortMode indexDefaultNullsSortMode,
-        IndexSearcher indexSearcher, bool nullFirst, int take)
+        IndexSearcher indexSearcher, bool includeNoValue, bool nullFirst, int take)
     {
         bool secondaryNullIsSmallest = (ctx.OrderByFields[1].NullsSortMode ?? indexDefaultNullsSortMode) == NullsSortMode.NullsSmallest;
         return new SortedDrivingWithTieBreakMatch(provider, llt, ctx.PlanParams.Allocator, indexSearcher,
@@ -803,6 +803,7 @@ internal static partial class QueryPlanBuilder
             ctx.OrderByFields[1].Field,
             ctx.OrderByFields[1].FieldType, 
             secondaryDescending: ctx.OrderByFields[1].Ascending is false,
+            includeNoValue: includeNoValue,
             nullFirst: nullFirst, 
             nullIsSmallest: secondaryNullIsSmallest,
             take: take);

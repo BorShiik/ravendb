@@ -43,7 +43,9 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
             scanSet.Compiled = ResidualScanIlEmitter.EmitDelegate(scanSet.Predicates, out scanCsharp);
         // DirectScan / CompoundField walk the driving clause via the tree and filter every OTHER clause per-entry. Their residual set excludes the DRIVING clause,
         // whereas the entry-scan set excludes clause[0] (the bitmap seed). Those differ whenever the driving clause is not the smallest-cardinality clause (always, for a range-driven scan).
-        var compoundFieldResidualSet = _exec.CompoundFieldDrivingClause is not null
+        // The compound walk takes only the negations the residual has always checked (!=, NOT IN, NOT ALL IN), so that negated filters
+        // bring no new queries to the compound key range, which has gaps of its own; any other negation leaves the compound walk out
+        var compoundFieldResidualSet = _exec.CompoundFieldDrivingClause is not null && _exec.Executions.Exists(HasNegationOtherThanNotEqualsOrIn) == false
             ? BuildResidualSet(_exec.Executions, perClause, _exec.CompoundFieldDrivingClause, _exec.CompoundFieldField2Range)
             : null;
         var directScanResidualSet = _exec.SortDrivingClause is not null
@@ -321,14 +323,22 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
 
     private ScanPredicateInfo? BuildScanPredicateInfoCore(ClauseExecution exec, ParamValueType termType)
     {
+        if (BuildPositiveScanPredicateInfo(exec, termType) is not { } pred)
+            return null;
+
+        // A negated clause passes exactly the entries its operand fails; NotEquals already carries the negation in its op
+        if (exec.IsNegated == false || exec.ClauseType == ClauseType.NotEquals)
+            return pred;
+
+        return pred with { Negated = true };
+    }
+
+    private ScanPredicateInfo? BuildPositiveScanPredicateInfo(ClauseExecution exec, ParamValueType termType)
+    {
         var clause = exec.Clause;
         // Single-valued ⟺ the field holds at most one term per entry. Can avoid a while(FindNext()) loop.
         // Folded into the structural plan key, so a single→multi flip re-plans instead of reusing this template.
         bool singleValued = (clause.ResolvedFieldName ?? clause.FieldName) is { } fieldName && _indexSearcher.HasMultipleTermsInField(fieldName) == false;
-
-        // The residual-scan IL only encodes negation for IN / ALL IN and not equality. everything else is not supported
-        if (exec.IsNegated && exec.ClauseType is not (ClauseType.In or ClauseType.AllIn or ClauseType.NotEquals))
-            return null;
 
         switch (exec.ClauseType)
         {
@@ -361,7 +371,6 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
                     },
                     CompareOp = exec.ClauseType == ClauseType.In ? ScanCompareOp.In : ScanCompareOp.AllIn,
                     ParamIndex = 0,
-                    Negated = exec.IsNegated,
                     IsSingleValued = singleValued
                 };
             }
@@ -509,6 +518,10 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
 
         return new ResidualScanSet { Predicates = residuals.ToArray(), ClauseIndices = indices.ToArray() };
     }
+
+    private static bool HasNegationOtherThanNotEqualsOrIn(ClauseExecution exec) =>
+        exec.IsNegated && exec.ClauseType is not (ClauseType.NotEquals or ClauseType.In or ClauseType.AllIn) ||
+        exec.SubExecutions?.Exists(HasNegationOtherThanNotEqualsOrIn) == true;
 
     // ClauseExecution.CompareTo sorts negated clauses LAST, so first being negated means they all are
     private readonly bool CheckAllNegated() => _exec.Executions is [{ IsNegated: true }, ..];

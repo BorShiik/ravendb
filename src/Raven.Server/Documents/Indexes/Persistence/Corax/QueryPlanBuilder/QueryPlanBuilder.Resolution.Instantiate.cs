@@ -286,9 +286,15 @@ internal static partial class QueryPlanBuilder
 
             double survivors = n;
             foreach (var it in execs)
-                survivors *= it.GetEffectiveCardinality(indexSearcher) / n;
+                survivors *= PassingEntries(it, indexSearcher) / n;
 
             return (long)Math.Clamp(survivors, 0, n);
+        }
+
+        static long PassingEntries(ClauseExecution exec, IndexSearcher indexSearcher)
+        {
+            long passing = CardinalityEstimator.EstimatePassing(exec, indexSearcher.NumberOfEntries);
+            return passing > 0 ? passing : indexSearcher.NumberOfEntries;
         }
 
         static long SurvivorSortCost(long survivors)
@@ -307,7 +313,7 @@ internal static partial class QueryPlanBuilder
             foreach (var exec in execs)
             {
                 if (exec == drivingClause) continue;
-                minResidual = Math.Min(exec.GetEffectiveCardinality(indexSearcher), minResidual);
+                minResidual = Math.Min(PassingEntries(exec, indexSearcher), minResidual);
             }
 
             if (minResidual > 0 && minResidual < indexSearcher.NumberOfEntries)

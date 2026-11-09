@@ -179,6 +179,17 @@ public static class ResidualScanIlEmitter
     /// <summary>If the predicate failed, we jump to the failLabel, success means falling from the end </summary>
     private static void EmitPredicate(ref DualEmit d, in ScanPredicateInfo pred, Label failLabel, string failName, ref int rootIdx, ref int inSetIdx, ref int paramSlotIdx, LocalBuilder readerRefLocal, int pIdx)
     {
+        if (pred.Negated)
+        {
+            var negatedPass = d.DefineLabelPair("notPassed");
+            var positive = pred with { Negated = false };
+            EmitPredicate(ref d, in positive, negatedPass.Il, negatedPass.Name, ref rootIdx, ref inSetIdx, ref paramSlotIdx, readerRefLocal, pIdx);
+            d.Il.Emit(OpCodes.Br, failLabel);
+            d.CsLine(Jump(failName));
+            d.MarkLabel(negatedPass);
+            return;
+        }
+
         if (pred.SubPredicates == null)
         {
             EmitLeafPredicate(ref d, in pred, failLabel, failName, rootIdx, ref inSetIdx, paramSlotIdx, readerRefLocal);
@@ -243,7 +254,7 @@ public static class ResidualScanIlEmitter
 
         // Build-time clause label for the residual C# mirror; no IL effect.
         if (pred.FieldName != null)
-            d.CsLine($"// {pred.FieldName} [{pred.CompareOp}{(pred.Negated ? ", negated" : string.Empty)}]");
+            d.CsLine($"// {pred.FieldName} [{pred.CompareOp}]");
 
         // reader.Reset();
         d.Il.Emit(OpCodes.Ldloc, readerRefLocal);
@@ -304,7 +315,7 @@ public static class ResidualScanIlEmitter
                 d.LoadInValueArray(inSetIdx, pred.ValueType);
                 d.LoadInHasNull(inSetIdx);
                 d.CallStatic(helper);
-                EmitBranch(ref d, failOnTrue: pred.Negated, failIl, failName);
+                EmitBranchFalse(ref d, failIl, failName);
                 inSetIdx++;
                 return;
             }
