@@ -775,11 +775,12 @@ internal static partial class QueryPlanBuilder
     }
 
     // if we need to read everything anyway, the cost of doing entry scanning is very high, reflect that
-    private static long ResolveEffectiveScanPageSize(QueryBuilderParameters builderParams)
+    private static long ResolveEffectiveScanTake(QueryBuilderParameters builderParams)
     {
-        return ResolveSortedScanTake(builderParams) == Constants.IndexSearcher.TakeAll
+        int take = ResolveSortedScanTake(builderParams);
+        return take == Constants.IndexSearcher.TakeAll
             ? long.MaxValue // we have to scan everything, the cost is too high
-            : builderParams.Query.PageSize;
+            : take; // the walk reads the skipped rows too
     }
 
     private static string DescribeUnboundedScanTake(QueryBuilderParameters builderParams)

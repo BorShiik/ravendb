@@ -227,6 +227,30 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void SortedScanCostGateCountsTheSkippedRows(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        SeedProducts(store);
+
+        // half of the walked entries pass, and the walk reads the entries of the skipped rows as well
+        foreach (var (offset, hint, first) in new[] { (20, "FieldSortedScan", 31), (900, "BitmapPipeline", 1811) })
+        {
+            var page = RunRql(store, $"from index 'Products/ByCatPrice' where Price > 10 and not Cat = 'b' order by Price as long limit 5 offset {offset}");
+            Assert.Equal(hint, page.Hint);
+            Assert.Equal(Enumerable.Range(first, 5).Select(i => $"products/{i}"), page.Ids);
+        }
+
+        // the same for the compound walk of Cat 'a', which checks Grp per document
+        foreach (var (offset, hint, first) in new[] { (20, "CompoundSortedScan", 40), (400, "BitmapPipeline", 1600) })
+        {
+            var page = RunRql(store, $"from index 'Products/Compound' where Cat = 'a' and Grp = 'x' order by Price as long limit 5 offset {offset}");
+            Assert.Equal(hint, page.Hint);
+            Assert.Equal(Enumerable.Range(0, 5).Select(k => $"products/{first + 2 * k}"), page.Ids);
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public void EqualsNullDoesNotDriveTheSortedWalk(Options options)
     {
         using var store = GetDocumentStore(options);
@@ -743,6 +767,20 @@ public class RavenDB_27920 : RavenTestBase
             }
         }
 
+        Indexes.WaitForIndexing(store);
+    }
+
+    private void SeedProducts(IDocumentStore store)
+    {
+        const string map = "from p in docs.Products select new { p.Cat, p.Price, p.Grp }";
+        store.Maintenance.Send(new PutIndexesOperation(
+            new IndexDefinition { Name = "Products/ByCatPrice", Maps = { map } },
+            new IndexDefinition { Name = "Products/Compound", Maps = { map }, CompoundFields = [["Cat", "Price"]] }));
+        using (var bulk = store.BulkInsert())
+        {
+            for (int i = 0; i < 2000; i++)
+                bulk.Store(new Product { Cat = i % 100 < 50 ? "a" : "b", Price = i, Grp = i % 2 == 0 ? "x" : "y" }, $"products/{i}");
+        }
         Indexes.WaitForIndexing(store);
     }
 

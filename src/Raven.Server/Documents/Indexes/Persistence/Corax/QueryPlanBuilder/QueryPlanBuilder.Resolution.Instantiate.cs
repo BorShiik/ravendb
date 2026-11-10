@@ -188,7 +188,7 @@ internal static partial class QueryPlanBuilder
             }
 
             // Residual present: read each entry's fields for the residual, may over-scan
-            entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCardinality, ResolveEffectiveScanPageSize(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
+            entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCardinality, ResolveEffectiveScanTake(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
             bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher)); // add the bitmap's survivor-sort cost
             string unboundedReason = ctx.WantTimings ? DescribeUnboundedScanTake(ctx.BuilderParams) : null;
             return IsDirectScanCostEffective(entriesToScan, bitmapCost, resultsWanted, passRate, ctx.WantTimings, unboundedReason, out reason);
@@ -228,7 +228,7 @@ internal static partial class QueryPlanBuilder
 
             // Residual present: scan reads scanned entry's fields and over-scans. Estimate the over-scan amount for the costs
             long drivingCard = drivingExec.GetEffectiveCardinality(indexSearcher);
-            var entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCard, ResolveEffectiveScanPageSize(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
+            var entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCard, ResolveEffectiveScanTake(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
 
             string unboundedReason = ctx.WantTimings ? DescribeUnboundedScanTake(ctx.BuilderParams) : null;
             return IsDirectScanCostEffective(entriesToScan, bitmapCost, resultsWanted, passRate, ctx.WantTimings, unboundedReason, out directScanReason);
@@ -303,10 +303,10 @@ internal static partial class QueryPlanBuilder
                 : survivors * QueryPrimitives.EntryScanSurvivorSortFactor;
 
         static long  ComputeNumberOfEntriesQueryLikelyToScan(List<ClauseExecution> execs,
-            ClauseExecution drivingClause, long drivingCard, long pageSize, IndexSearcher indexSearcher,
+            ClauseExecution drivingClause, long drivingCard, long take, IndexSearcher indexSearcher,
             out long resultsWanted, out double passRate)
         {
-            resultsWanted = Math.Min(drivingCard, pageSize);
+            resultsWanted = Math.Min(drivingCard, take);
             passRate = 1.0; // no selective residual narrows the walk
 
             long minResidual = long.MaxValue;
