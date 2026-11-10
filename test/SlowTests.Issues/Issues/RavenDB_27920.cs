@@ -370,6 +370,287 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeWalksOnlyTheKeysOfTheDrivingValue(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(
+            new IndexDefinition { Name = "Items/ByTagAge", Maps = { "from d in docs.Items select new { d.Tag, d.Age }" }, CompoundFields = [["Tag", "Age"]] },
+            new IndexDefinition { Name = "Items/ByTagName", Maps = { "from d in docs.Items select new { d.Tag, d.Name }" }, CompoundFields = [["Tag", "Name"]] }));
+
+        var tags = new[] { "a", "ab", "aé", "an" };
+        using (var commands = store.Commands())
+        {
+            var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+            for (int i = 0; i < 400; i++)
+            {
+                var doc = new Dictionary<string, object>
+                {
+                    ["Tag"] = tags[i % 4],
+                    ["Age"] = i % 37 == 0 ? null : (long)(i % 100),
+                    ["Name"] = i % 43 == 0 ? null : tags[i % 4] == "an" ? $"0{i % 100:D2}" : $"n{i % 100:D3}"
+                };
+                if (i % 41 == 0)
+                    doc.Remove("Age");
+                commands.Put($"items/{i}", null, doc, meta);
+            }
+
+            // its key starts with the bytes of 'aé' and lies inside the ranges of that value
+            commands.Put("items/shorter", null, new Dictionary<string, object> { ["Tag"] = "a", ["Age"] = 0x43A9000000000005L }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        var queries = new[]
+        {
+            "from index 'Items/ByTagAge' where Tag = 'a' and Age < 50 order by Age as long",
+            "from index 'Items/ByTagAge' where Tag = 'a' and Age > 10 order by Age as long",
+            "from index 'Items/ByTagAge' where Tag = 'a' and Age >= 10 order by Age as long desc",
+            "from index 'Items/ByTagAge' where Tag = 'a' and Age between 10 and 50 order by Age as long",
+            "from index 'Items/ByTagAge' where Tag = 'aé' and Age < 50 order by Age as long",
+            "from index 'Items/ByTagName' where Tag = 'a' and Name < 'n050' order by Name",
+            "from index 'Items/ByTagName' where Tag = 'a' and Name > 'n010' order by Name desc",
+            "from index 'Items/ByTagName' where Tag = 'a' and Name between 'n010' and 'n050' order by Name"
+        };
+        // The keys of 'ab', 'aé', 'an' and of items/shorter lie inside most of these ranges, which take the bitmap then. Ages 10 to 50
+        // start with the byte 0x80, and no other value continues 'a' with it.
+        foreach (var query in queries)
+        {
+            var scan = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(query.Contains("between 10 and 50") ? "CompoundSortedScan" : "BitmapPipeline", scan.Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
+        }
+
+        var emptyMeta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+            commands.Put("items/other-empty", null, new Dictionary<string, object> { ["Tag"] = "a", ["Name"] = "" }, emptyMeta);
+        Indexes.WaitForIndexing(store);
+
+        const string aboveEmpty = "from index 'Items/ByTagName' where Tag = 'ab' and Name > 'n010' order by Name desc";
+        var walk = RunRql(store, aboveEmpty, "CompoundSortedScan");
+        Assert.Equal("CompoundSortedScan", walk.Hint);
+        Assert.Equal(RunRql(store, aboveEmpty, "BitmapPipeline").Ids, walk.Ids);
+
+        using (var commands = store.Commands())
+            commands.Put("items/empty", null, new Dictionary<string, object> { ["Tag"] = "ab", ["Name"] = "" }, emptyMeta);
+        Indexes.WaitForIndexing(store);
+
+        const string withEmpty = "from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name";
+        var bitmap = RunRql(store, withEmpty, "BitmapPipeline").Ids;
+        Assert.Contains("items/empty", bitmap);
+        Assert.Equal(bitmap, RunRql(store, withEmpty, "CompoundSortedScan").Ids);
+
+        // a lone "\u0003" shares the term of the empty string, but its key holds its byte, below the first byte of every other Name
+        using (var commands = store.Commands())
+        {
+            commands.Put("items/u", null, new Dictionary<string, object> { ["Tag"] = "u", ["Name"] = "n001" }, emptyMeta);
+            commands.Put("items/u-etx", null, new Dictionary<string, object> { ["Tag"] = "u", ["Name"] = "\u0003" }, emptyMeta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        const string belowNames = "from index 'Items/ByTagName' where Tag = 'u' and Name < 'n050' order by Name";
+        var lone = RunRql(store, belowNames, "CompoundSortedScan");
+        Assert.Equal("CompoundSortedScan", lone.Hint);
+        Assert.Equal(RunRql(store, belowNames, "BitmapPipeline").Ids, lone.Ids);
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeIsWalkedOnlyWhenNoOtherValueHasKeysInside(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        const string map = "from o in docs.Orders select new { o.Customer, o.Amount, o.Qty, o.Title, o.Score }";
+        store.Maintenance.Send(new PutIndexesOperation(
+            new IndexDefinition { Name = "Orders/ByCustomerAmount", Maps = { map }, CompoundFields = [["Customer", "Amount"]] },
+            new IndexDefinition { Name = "Orders/ByCustomerQty", Maps = { map }, CompoundFields = [["Customer", "Qty"]] },
+            new IndexDefinition { Name = "Orders/ByCustomerTitle", Maps = { map }, CompoundFields = [["Customer", "Title"]] },
+            new IndexDefinition { Name = "Orders/ByCustomerScore", Maps = { map }, CompoundFields = [["Customer", "Score"]] }));
+
+        // every key of customers/10 starts with the bytes of customers/1 followed by '0'
+        var meta = new Dictionary<string, object> { ["@collection"] = "Orders" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 0; i < 600; i++)
+            {
+                commands.Put($"orders/{i}", null, new Dictionary<string, object>
+                {
+                    ["Customer"] = new[] { "customers/1", "customers/10", "customers/7" }[i % 3], ["Amount"] = (long)(i / 3 + 1), ["Qty"] = (long)(i % 50), ["Title"] = $"t{i / 3:D3}",
+                    ["Score"] = i + 0.5
+                }, meta);
+            }
+
+            commands.Put("orders/no-qty", null, new Dictionary<string, object> { ["Customer"] = "customers/7", ["Amount"] = 5L, ["Title"] = "t999" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        foreach (var (query, hint) in new[]
+                 {
+                     // '0' is below the first byte of every amount, also below the smallest one that ends the open side
+                     ("from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount > 100 order by Amount as long", "CompoundSortedScan"),
+                     ("from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount < 150 order by Amount as long desc", "CompoundSortedScan"),
+                     // a Qty of 0 leaves the open side at the first byte 0x00, where the keys of customers/10 are
+                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/1' and Qty < 20 order by Qty as long", "BitmapPipeline"),
+                     // a Qty of 0 adds only the first bytes 0x00 and 0xFF, so no key of customers/1 continues customers/10
+                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/10' and Qty > 20 order by Qty as long", "CompoundSortedScan"),
+                     // no other value has keys inside, and the key of orders/no-qty, with no Qty, is skipped
+                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/7' and Qty < 20 order by Qty as long", "CompoundSortedScan"),
+                     ("from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < 't100' order by Title", "CompoundSortedScan"),
+                     // a double is written by its own bits, so the open side ends at its first byte 0x3F, above the '0' of customers/10
+                     ("from index 'Orders/ByCustomerScore' where Customer = 'customers/1' and Score < 150.5 order by Score as double", "CompoundSortedScan")
+                 })
+        {
+            var scan = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(hint, scan.Hint),
+                () => Assert.Equal(hint, RunRql(store, query).Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids),
+                () => Assert.Equal(RunWithStatistics(store, query + " limit 7", "BitmapPipeline"), RunWithStatistics(store, query + " limit 7", "CompoundSortedScan")));
+        }
+
+        // the key customers/10 + 11 would be a customers/1 order whose Title is '0', and no order has it
+        const string fromEmpty = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/10' and Title >= '' order by Title limit 10";
+        var fromEmptyScan = RunRql(store, fromEmpty, "CompoundSortedScan");
+        Assert.Equal("CompoundSortedScan", fromEmptyScan.Hint);
+        using (var session = store.OpenSession())
+        {
+            // the reference sorts in memory, the index-order sort cannot seek to an empty string (RavenDB-27813)
+            var inMemoryIds = session.Advanced.RawQuery<Item>(fromEmpty).NoCaching().AddParameter("rvn_corax_strategy", "BitmapPipeline")
+                .AddParameter("rvn_corax_entry_scan", -1L).AddParameter("rvn_corax_sort", "InMemorySort").ToList().Select(x => x.Id).ToArray();
+            Assert.Equal(inMemoryIds, fromEmptyScan.Ids);
+        }
+
+        // a title starting with '0' widens the open side down to the keys of customers/10
+        using (var commands = store.Commands())
+            commands.Put("orders/zero", null, new Dictionary<string, object> { ["Customer"] = "customers/7", ["Amount"] = 1L, ["Qty"] = 1L, ["Title"] = "0ld" }, meta);
+        Indexes.WaitForIndexing(store);
+
+        const string belowTitle = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < 't100' order by Title";
+        var widened = RunRql(store, belowTitle, "CompoundSortedScan");
+        Assert.Equal("BitmapPipeline", widened.Hint);
+        Assert.Equal(RunRql(store, belowTitle, "BitmapPipeline").Ids, widened.Ids);
+
+        // a bound longer than a key component can hold has no range keys, and the range is not part of the per-document check
+        string longBound = "t05" + new string('x', 300);
+        using (var session = store.OpenSession())
+        {
+            const string rql = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < $b order by Title";
+            var bitmapIds = session.Advanced.RawQuery<Item>(rql).NoCaching().AddParameter("b", longBound)
+                .AddParameter("rvn_corax_strategy", "BitmapPipeline").AddParameter("rvn_corax_entry_scan", -1L).ToList().Select(x => x.Id).ToArray();
+            var scanIds = session.Advanced.RawQuery<Item>(rql).NoCaching().AddParameter("b", longBound)
+                .AddParameter("rvn_corax_strategy", "CompoundSortedScan").ToList().Select(x => x.Id).ToArray();
+            Assert.Equal(60, bitmapIds.Length);
+            Assert.Equal(bitmapIds, scanIds);
+        }
+
+        // its key customers/1 + '0ld' + 11 is customers/10 + 'ld' + 11, inside the range of customers/10
+        using (var commands = store.Commands())
+            commands.Put("orders/old", null, new Dictionary<string, object> { ["Customer"] = "customers/1", ["Title"] = "0ld" }, meta);
+        Indexes.WaitForIndexing(store);
+
+        const string longerValue = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/10' and Title < 't100' order by Title";
+        var inside = RunRql(store, longerValue, "CompoundSortedScan");
+        Assert.Equal("BitmapPipeline", inside.Hint);
+        Assert.Equal(RunRql(store, longerValue, "BitmapPipeline").Ids, inside.Ids);
+
+        // 2^-15 is written 3F 00 00 00 00 00 00 00, so its key continues the open side's end at the first byte 0x3F with zeros
+        using (var commands = store.Commands())
+            commands.Put("orders/tiny", null, new Dictionary<string, object> { ["Customer"] = "customers/1", ["Score"] = System.Math.Pow(2, -15) }, meta);
+        Indexes.WaitForIndexing(store);
+
+        const string belowScore = "from index 'Orders/ByCustomerScore' where Customer = 'customers/1' and Score < 150.5 order by Score as double";
+        var tiny = RunRql(store, belowScore, "CompoundSortedScan");
+        Assert.Equal("CompoundSortedScan", tiny.Hint);
+        Assert.Equal(RunRql(store, belowScore, "BitmapPipeline").Ids, tiny.Ids);
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeSkipsTheKeysOfAnEmptyField1(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Items/ByLangTitle", Maps = { "from d in docs.Items select new { d.Lang, d.Title }" }, CompoundFields = [["Lang", "Title"]]
+        }));
+        using (var commands = store.Commands())
+        {
+            var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+            for (int i = 0; i < 100; i++)
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Lang"] = i % 2 == 1 ? "en" : "de", ["Title"] = $"w{i:D3}" }, meta);
+
+            // a key with an empty field1 is field2 + 0, which starts with 'en' when field2 does
+            commands.Put("items/z-null", null, new Dictionary<string, object> { ["Lang"] = null, ["Title"] = "energy" }, meta);
+            commands.Put("items/z-missing", null, new Dictionary<string, object> { ["Title"] = "enzyme" }, meta);
+            commands.Put("items/z-empty", null, new Dictionary<string, object> { ["Lang"] = "", ["Title"] = "enormous" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        const string query = "from index 'Items/ByLangTitle' where Lang = 'en' and Title >= 'a' order by Title";
+        var bitmap = RunRql(store, query, "BitmapPipeline");
+        Assert.Equal(50, bitmap.Ids.Length);
+        Assert.Equal(bitmap.Ids, RunRql(store, query, "CompoundSortedScan").Ids);
+        Assert.Equal(bitmap.Ids, RunRql(store, query).Ids);
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeSeeksNoKeyThatEndsInAZeroByte(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(
+            new IndexDefinition { Name = "Items/ByCatQty", Maps = { "from d in docs.Items select new { d.Cat, d.Qty }" }, CompoundFields = [["Cat", "Qty"]] },
+            new IndexDefinition { Name = "Items/ByTagName", Maps = { "from d in docs.Items select new { d.Tag, d.Name }" }, CompoundFields = [["Tag", "Name"]] },
+            new IndexDefinition { Name = "Items/ByCodeLabel", Maps = { "from d in docs.Items select new { d.Code, d.Label }" }, CompoundFields = [["Code", "Label"]] },
+            new IndexDefinition { Name = "Items/ByNumText", Maps = { "from d in docs.Items select new { d.Num, d.Text }" }, CompoundFields = [["Num", "Text"]] }));
+        var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 0; i <= 20; i++)
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Cat"] = 5L, ["Qty"] = (long)i, ["Tag"] = "ab", ["Name"] = $"n{i:D3}" }, meta);
+            for (int i = 0; i < 8; i++)
+                commands.Put($"items/abc-{i}", null, new Dictionary<string, object> { ["Code"] = "abc", ["Label"] = $"x{i}" }, meta);
+            // the open low of abc ends at the first byte 2 of U+0002, and the key of Code ab with Label c is abc + 2
+            commands.Put("items/ab-c", null, new Dictionary<string, object> { ["Code"] = "ab", ["Label"] = "c" }, meta);
+            commands.Put("items/q", null, new Dictionary<string, object> { ["Code"] = "q", ["Label"] = "\u0002foo" }, meta);
+            // Num 0 is written ending in 0, so a low of Num 0 + 1 would read as 0 1 1, above the key of '\u0001\0x'
+            foreach (var text in new[] { "\u0001\0x", "\u0001b", "m1", "m2" })
+                commands.Put($"items/num-{text.Length}-{text[^1]}", null, new Dictionary<string, object> { ["Num"] = 0L, ["Text"] = text }, meta);
+            // the key of a missing Cat is Qty + 0, here the bytes of Cat 5 followed by 0
+            commands.Put("items/no-cat", null, new Dictionary<string, object> { ["Qty"] = 5L }, meta);
+            // the open low of 'ab' ends at the first byte 'n', which this Name continues with zeros
+            commands.Put("items/nul8", null, new Dictionary<string, object> { ["Tag"] = "ab", ["Name"] = "n" + new string('\0', 8) }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        // The tree reads a key that ends in 0, or in 0 and then 1s, as if it went on with another 1, so the key of items/no-cat lies inside an
+        // open low of Cat 5 that starts with zeros (a Qty of 0 also indexes the double 0.0, whose first byte is 0)
+        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long", "BitmapPipeline");
+        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long desc", "BitmapPipeline");
+        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name", "CompoundSortedScan");
+        AssertRows("from index 'Items/ByCodeLabel' where Code = 'abc' and Label < 'z' order by Label", "BitmapPipeline");
+        AssertRows("from index 'Items/ByNumText' where Num = 0 and Text < 'z' order by Text", "CompoundSortedScan");
+
+        // a boolean false is written as the byte 0, so the open low of 'ab' starts with zeros, and a Tag that continues 'ab' with zeros lies inside
+        using (var commands = store.Commands())
+        {
+            commands.Put("items/flag", null, new Dictionary<string, object> { ["Tag"] = "zz", ["Name"] = false }, meta);
+            commands.Put("items/ab00", null, new Dictionary<string, object> { ["Tag"] = "ab\0\0x", ["Name"] = "n005" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name", "BitmapPipeline");
+
+        void AssertRows(string query, string hint)
+        {
+            var scan = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(hint, scan.Hint),
+                () => Assert.Equal(hint, RunRql(store, query).Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public void TwoKeyWalkOrdersEqualKeysLikeTheBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
@@ -509,6 +790,19 @@ public class RavenDB_27920 : RavenTestBase
         string hint = null;
         Find((QueryInspectionNode)timings.QueryPlan, "CompiledQuery")?.Parameters?.TryGetValue("OptimizationHint", out hint);
         return (ids, hint);
+    }
+
+    private static (string Ids, long Total) RunWithStatistics(IDocumentStore store, string rql, string strategy)
+    {
+        using var session = store.OpenSession();
+        var ids = session.Advanced.RawQuery<Item>(rql)
+            .NoCaching()
+            .Statistics(out QueryStatistics statistics)
+            .AddParameter("rvn_corax_strategy", strategy)
+            .AddParameter("rvn_corax_entry_scan", -1L)
+            .ToList()
+            .Select(x => x.Id);
+        return (string.Join(", ", ids), statistics.TotalResults);
     }
 
     private static QueryInspectionNode Find(QueryInspectionNode node, string operation)

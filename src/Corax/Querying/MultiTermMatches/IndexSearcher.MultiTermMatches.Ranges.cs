@@ -165,7 +165,7 @@ public partial class IndexSearcher
     public IQueryMatch BetweenQuerySlice(in FieldMetadata field, Slice low, Slice high, bool forward = true)
         => RangeBuilder<Range.Inclusive, Range.Inclusive>(field, low, high, forward);
 
-    public IQueryMatch RangeBuilder<TLow, THigh>(in FieldMetadata field, Slice low, Slice high, bool forward)
+    public IQueryMatch RangeBuilder<TLow, THigh>(in FieldMetadata field, Slice low, Slice high, bool forward, long excludedTermId = -1)
         where TLow : struct, Range.Marker
         where THigh : struct, Range.Marker
     {
@@ -174,8 +174,8 @@ public partial class IndexSearcher
             return EmptyQueryMatch.Instance;
 
         ITermsProvider provider = forward
-            ? new TermsRangeProvider<Lookup<CompactKeyLookup>.ForwardIterator, TLow, THigh>(this, terms, field, low, high)
-            : (ITermsProvider)new TermsRangeProvider<Lookup<CompactKeyLookup>.BackwardIterator, TLow, THigh>(this, terms, field, low, high);
+            ? new TermsRangeProvider<Lookup<CompactKeyLookup>.ForwardIterator, TLow, THigh>(this, terms, field, low, high, excludedTermId)
+            : (ITermsProvider)new TermsRangeProvider<Lookup<CompactKeyLookup>.BackwardIterator, TLow, THigh>(this, terms, field, low, high, excludedTermId);
 
         return new TermsProviderMatch(provider, _transaction.LowLevelTransaction, _transaction.Allocator);
     }
