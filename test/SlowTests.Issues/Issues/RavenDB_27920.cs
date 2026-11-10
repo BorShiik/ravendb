@@ -330,6 +330,19 @@ public class RavenDB_27920 : RavenTestBase
             AssertTwoKeyWalkMatchesBitmap(store, "Items/ByCat", order);
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void TwoKeyWalkPlacesNullStringSecondariesLikeTheBitmap(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        SeedTwoKeys(store);
+
+        foreach (var order in new[] { "Cat, S nulls last", "Cat, S desc nulls first", "Cat desc, S nulls last" })
+            AssertTwoKeyWalkMatchesBitmap(store, "Items/ByCat", order);
+        foreach (var order in new[] { "Cat, S", "Cat, S desc" })
+            AssertTwoKeyWalkMatchesBitmap(store, "Items/ByCatNullsLargest", order);
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })
