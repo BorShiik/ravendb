@@ -2,6 +2,7 @@ using System;
 using Corax.Mappings;
 using Corax.Querying.Matches;
 using Corax.Querying.Matches.Meta;
+using Corax.Querying.Matches.SortingMatches.Meta;
 using Corax.Querying.Planning;
 using Corax.Querying.Primitives;
 using Raven.Server.Documents.Queries;
@@ -81,6 +82,21 @@ internal static partial class QueryPlanBuilder
 
         IQueryMatch CreateDrivingMatch(ref InstantiateContext context)
         {
+            string fieldName = context.Exec.Plan.Template.CompoundFieldSortName;
+            var field1Meta = QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, field1Name, hasBoost: false);
+            var field2Meta = QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, fieldName, hasBoost: false);
+
+            // A component is written by the type of the document's value, so a key built from a value of one type can neither place
+            // nor tell apart the field's values of another; without a range, field2 is placed by the type the ORDER BY compares
+            int? field2Type = field2Range?.PackedParamValue.ValueType ?? context.OrderByFields[0].FieldType switch
+            {
+                MatchCompareFieldType.Sequence => PackedParam.TypeString,
+                MatchCompareFieldType.Integer or MatchCompareFieldType.Floating => PackedParam.TypeLong,
+                _ => null
+            };
+            if (field2Type is not { } type || HoldsAnotherType(field1Meta, packed.ValueType) || HoldsAnotherType(field2Meta, type))
+                return null;
+
             // No field2 narrowing: run a prefix scan on field1 and let entry-scan residuals filter the rest.
             if (field2Range is null)
             {
@@ -90,20 +106,18 @@ internal static partial class QueryPlanBuilder
             }
 
             // The field2 range is not part of the residual, so a range its keys cannot express is left to the bitmap
-            string fieldName = context.Exec.Plan.Template.CompoundFieldSortName;
             if (TryBuildCompositeRangeKeys(ref context, analyzedPrefix, fieldName, field2Range, out var lowSlice, out var highSlice) == false)
                 return null;
 
-            // The driving value's key with an empty field2 (null, missing, empty string) lies inside the range and is skipped by its id.
+            // The driving value's key with an empty field2 (null, missing, empty string) may lie inside the range and is skipped by its id.
             // The empty string is a real value, so a string range that may hold it is left to the bitmap while the field has one.
             emptyField2TermId = FindKey([], analyzedPrefix.Size);
-            if (emptyField2TermId != -1 && RangeMayHoldEmptyString(ref context, fieldName))
+            if (emptyField2TermId != -1 && RangeMayHoldEmptyString(ref context, field2Meta))
                 return null;
 
             // Every key inside the range starts with the driving value's bytes P: the value's own keys, and the keys of another value
             // that starts with P, or that P starts with when its field2 continues P. The walk takes the keys in bulk, so an open side ends at
             // the first bytes field2's values can start with, and the range is left to the bitmap while another value's keys may lie inside.
-            var field2Meta = QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, fieldName, hasBoost: false);
             Span<bool> firstBytes = stackalloc bool[byte.MaxValue + 1];
             Field2FirstBytes(ref context, field2Meta, firstBytes);
             int firstLow = firstBytes.IndexOf(true), firstHigh = firstBytes.LastIndexOf(true);
@@ -115,7 +129,7 @@ internal static partial class QueryPlanBuilder
                 highSlice = PrefixWith(ref context, (byte)firstHigh, sizeof(long));
 
             int p = analyzedPrefix.Size;
-            if (OtherField1KeysMayLieInRange(ref context, field2Meta, lowSlice[p], highSlice[p], firstBytes))
+            if (OtherField1KeysMayLieInRange(field1Meta, field2Meta, lowSlice[p], highSlice[p], firstBytes))
                 return null;
 
             usedCompositeRange = true;
@@ -237,9 +251,8 @@ internal static partial class QueryPlanBuilder
         // Another field1 value Q has keys inside the range only when they start with P. When Q starts with P, the byte after P is Q's own.
         // When P starts with Q, the key is Q + field2 + |Q| with field2 continuing P: if field2 is the rest of P the key is P + |Q|,
         // otherwise the byte after P is the byte of field2 that follows the rest of P.
-        bool OtherField1KeysMayLieInRange(ref InstantiateContext context, in FieldMetadata field2Meta, byte low, byte high, scoped ReadOnlySpan<bool> firstBytes)
+        bool OtherField1KeysMayLieInRange(in FieldMetadata field1Meta, in FieldMetadata field2Meta, byte low, byte high, scoped ReadOnlySpan<bool> firstBytes)
         {
-            var field1Meta = QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, field1Name, hasBoost: false);
             var field1Terms = indexSearcher.GetTermsFor(field1Meta.FieldName);
             var value = analyzedPrefix.AsReadOnlySpan();
             if (HasTermContinuing(field1Terms, value, low, high))
@@ -301,7 +314,14 @@ internal static partial class QueryPlanBuilder
             return indexSearcher.GetTermsFor(compoundFieldMeta.FieldName) is { } terms && terms.TryGetValue(key, out long termId) ? termId : -1;
         }
 
-        bool RangeMayHoldEmptyString(ref InstantiateContext context, string fieldName)
+        bool HoldsAnotherType(in FieldMetadata fieldMeta, int valueType)
+        {
+            return valueType == PackedParam.TypeString
+                ? indexSearcher.NumberOfEntriesWithNumericValue(fieldMeta) > 0
+                : indexSearcher.HasNonNumericValues(fieldMeta);
+        }
+
+        bool RangeMayHoldEmptyString(ref InstantiateContext context, in FieldMetadata field2Meta)
         {
             if (field2Range.PackedParamValue.ValueType != PackedParam.TypeString)
                 return false;
@@ -310,7 +330,7 @@ internal static partial class QueryPlanBuilder
                 context.Exec.StringValues[field2Range.PackedParamValue.Param1] is { Length: > 0 } low && low[0] > Constants.EmptyString[0])
                 return false; // the empty string sorts below this low bound
 
-            return indexSearcher.NumberOfDocumentsUnderSpecificTerm(QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, fieldName, hasBoost: false), string.Empty) > 0;
+            return indexSearcher.NumberOfDocumentsUnderSpecificTerm(field2Meta, string.Empty) > 0;
         }
 
         long TryResolveCompoundKnownTotal(ref InstantiateContext context)

@@ -287,6 +287,8 @@ public class RavenDB_27920 : RavenTestBase
     {
         using var store = GetDocumentStore(options);
         Seed(store);
+        using (var commands = store.Commands())
+            commands.Delete("items/e1", null); // its string Age leaves every compound range on Age to the bitmap
         store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
         {
             Name = "Items/ByTagAge",
@@ -670,6 +672,90 @@ public class RavenDB_27920 : RavenTestBase
                 () => Assert.Equal(hint, scan.Hint),
                 () => Assert.Equal(hint, RunRql(store, query).Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundWalkLeavesAComponentOfMixedTypesToTheBitmap(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(
+            new IndexDefinition { Name = "Items/ByTagAge", Maps = { "from d in docs.Items select new { d.Tag, d.Age }" }, CompoundFields = [["Tag", "Age"]] },
+            new IndexDefinition { Name = "Items/ByTagName", Maps = { "from d in docs.Items select new { d.Tag, d.Name }" }, CompoundFields = [["Tag", "Name"]] }));
+
+        var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 0; i < 100; i++)
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Tag"] = "ab"[i % 2].ToString(), ["Age"] = (long)(i % 50), ["Name"] = $"n{i:D3}" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        // the walk returns a number Age by its value, while an implicit ORDER BY compares its text
+        const string byAgeText = "from index 'Items/ByTagAge' where Tag = 'b' order by Age";
+        Assert.Equal(RunRql(store, byAgeText, "BitmapPipeline").Ids, RunRql(store, byAgeText).Ids);
+        // an alphanumeric ORDER BY compares the digits by their value, the walk by their bytes
+        Assert.Equal("BitmapPipeline", RunRql(store, "from index 'Items/ByTagName' where Tag = 'a' order by Name as alphanumeric", "CompoundSortedScan").Hint);
+
+        const string byAge = "from index 'Items/ByTagAge' where Tag = 'a' and Age <= 30 order by Age as long";
+        const string byName = "from index 'Items/ByTagName' where Tag = 'a' and Name > 'n040' order by Name";
+        const string byAgePrefix = "from index 'Items/ByTagAge' where Tag = 'a' order by Age as long";
+        const string byNamePrefix = "from index 'Items/ByTagName' where Tag = 'a' order by Name limit 3";
+        // The keys of a string and a boolean Age lie below the keys of positive numbers, the key of a number Name above the keys of
+        // strings, and a number Tag writes eight bytes a string Tag can start with
+        foreach (var (id, doc, query) in new (string, Dictionary<string, object>, string)[]
+                 {
+                     ("items/old", new() { ["Tag"] = "a", ["Age"] = "old", ["Name"] = "n100" }, byAge),
+                     ("items/old", new() { ["Tag"] = "a", ["Age"] = "old", ["Name"] = "n100" }, byAgePrefix),
+                     ("items/flag", new() { ["Tag"] = "a", ["Age"] = true, ["Name"] = "n101" }, byAge),
+                     ("items/number", new() { ["Tag"] = "a", ["Age"] = 1L, ["Name"] = 5L }, byName),
+                     ("items/number", new() { ["Tag"] = "a", ["Age"] = 1L, ["Name"] = 5L }, byNamePrefix),
+                     ("items/number-tag", new() { ["Tag"] = 5L, ["Age"] = 1L, ["Name"] = "n102" }, byAge)
+                 })
+        {
+            using (var commands = store.Commands())
+                commands.Put(id, null, doc, meta);
+            Indexes.WaitForIndexing(store);
+
+            var forced = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => $"{id}: {query}",
+                () => Assert.Equal("BitmapPipeline", forced.Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, forced.Ids),
+                () => Assert.Equal("BitmapPipeline", RunRql(store, query).Hint));
+
+            using (var commands = store.Commands())
+                commands.Delete(id, null);
+            Indexes.WaitForIndexing(store);
+
+            var walk = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => $"without {id}: {query}",
+                () => Assert.Equal("CompoundSortedScan", walk.Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, walk.Ids));
+        }
+
+        // a number driving value next to the string Tags
+        using (var commands = store.Commands())
+            commands.Put("items/number-tag", null, new Dictionary<string, object> { ["Tag"] = 5L, ["Age"] = 1L, ["Name"] = "n102" }, meta);
+        Indexes.WaitForIndexing(store);
+
+        const string byNumberTag = "from index 'Items/ByTagAge' where Tag = 5 and Age <= 30 order by Age as long";
+        var numberTag = RunRql(store, byNumberTag, "CompoundSortedScan");
+        Assert.Equal("BitmapPipeline", numberTag.Hint);
+        Assert.Equal(["items/number-tag"], numberTag.Ids);
+
+        // a number Tag writes the eight bytes of this string Tag, so a walk of either value meets the keys of both
+        using (var commands = store.Commands())
+        {
+            commands.Put("items/same-number", null, new Dictionary<string, object> { ["Tag"] = -8300572421495964L, ["Age"] = 2L }, meta);
+            commands.Put("items/same-string", null, new Dictionary<string, object> { ["Tag"] = "\u007F€abcd", ["Age"] = 3L }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        foreach (var tag in new[] { "-8300572421495964", "'\u007F€abcd'" })
+        {
+            string query = $"from index 'Items/ByTagAge' where Tag = {tag} order by Age as long";
+            RavenTestHelper.AssertAll(() => query, () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, RunRql(store, query, "CompoundSortedScan").Ids));
         }
     }
 
