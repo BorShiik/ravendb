@@ -673,6 +673,35 @@ public class RavenDB_27920 : RavenTestBase
             AssertTwoKeyWalkMatchesBitmap(store, "Items/ByCatNullsLargest", order);
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void EmptyAllInInAGroupMatchesNothingInTheResidual(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        Seed(store);
+        var empty = ("e", (object)System.Array.Empty<string>());
+
+        foreach (var (where, count) in new[]
+                 {
+                     ("where Tag = '2' and (endsWith(Name, '7') or Tags all in ($e))", 0),
+                     ("where Tag = '2' and not (endsWith(Name, '2') and Tags all in ($e))", 10)
+                 })
+        {
+            var noScan = Run(store, where, empty, ("rvn_corax_entry_scan", -1L)).Ids.Order().ToArray();
+            int gate = Enumerable.Range(0, 16).FirstOrDefault(g => Run(store, where, empty, ("rvn_corax_entry_scan", (long)g)).EntryScanAt == g, -1);
+            RavenTestHelper.AssertAll(() => where,
+                () => Assert.Equal(count, noScan.Length),
+                () => Assert.True(gate >= 0, "the entry scan has no gate for this query"),
+                () => Assert.Equal(noScan, Run(store, where, empty, ("rvn_corax_entry_scan", (long)gate)).Ids.Order()));
+        }
+
+        const string sorted = "where Age >= 0 and (endsWith(Name, '7') or Tags all in ($e)) order by Age as long";
+        var bitmap = Run(store, sorted, empty, ("rvn_corax_strategy", "BitmapPipeline"));
+        var scan = Run(store, sorted, empty, ("rvn_corax_strategy", "FieldSortedScan"));
+        Assert.Equal("FieldSortedScan", scan.Hint);
+        Assert.Equal(bitmap.Ids, scan.Ids);
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })
@@ -754,16 +783,17 @@ public class RavenDB_27920 : RavenTestBase
         Indexes.WaitForIndexing(store);
     }
 
-    private static (string[] Ids, string Hint, int EntryScanAt) Run(IDocumentStore store, string where, string parameter, object value)
+    private static (string[] Ids, string Hint, int EntryScanAt) Run(IDocumentStore store, string where, string parameter, object value) => Run(store, where, (parameter, value));
+
+    private static (string[] Ids, string Hint, int EntryScanAt) Run(IDocumentStore store, string where, params (string Name, object Value)[] parameters)
     {
         using var session = store.OpenSession();
-        var ids = session.Advanced.RawQuery<Item>($"from index 'Items/ByAll' {where} include timings()")
+        var query = session.Advanced.RawQuery<Item>($"from index 'Items/ByAll' {where} include timings()")
             .NoCaching()
-            .Timings(out QueryTimings timings)
-            .AddParameter(parameter, value)
-            .ToList()
-            .Select(x => x.Id)
-            .ToArray();
+            .Timings(out QueryTimings timings);
+        foreach (var (name, value) in parameters)
+            query = query.AddParameter(name, value);
+        var ids = query.ToList().Select(x => x.Id).ToArray();
 
         var plan = (QueryInspectionNode)timings.QueryPlan;
         string hint = null;

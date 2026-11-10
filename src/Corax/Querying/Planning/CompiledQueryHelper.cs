@@ -158,8 +158,8 @@ public static class CompiledQueryHelper
         // we need to handle ALL IN ($terms), with null as an option, as well ass $terms = [x,x] - so the same value repeated
         
         TComparer compare = default;
-        if (values.Length == 0)
-            return includeNull == false || CheckFieldTermIsNull(ref reader, fieldRootPage, singleValued: false);
+        if (values.Length == 0) // as in the bitmap: an empty list matches nothing, a list of only null matches the null values
+            return includeNull && CheckFieldTermIsNull(ref reader, fieldRootPage, singleValued: false);
 
         bool hasNull = false;
         for (int chunk = 0; chunk < values.Length; chunk += 64)
