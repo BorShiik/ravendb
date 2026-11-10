@@ -795,7 +795,7 @@ internal static partial class QueryPlanBuilder
     }
 
     private static IQueryMatch BuildSortedDrivingWithTieBreakMatch(InstantiateContext ctx, ITermsProvider provider, LowLevelTransaction llt, NullsSortMode indexDefaultNullsSortMode,
-        IndexSearcher indexSearcher, bool includeNoValue, bool nullFirst, int take)
+        IndexSearcher indexSearcher, bool includeNoValue, bool nullFirst, int take, ResidualScanIlEmitter.ResidualScanPredicate residual)
     {
         bool secondaryNullIsSmallest = (ctx.OrderByFields[1].NullsSortMode ?? indexDefaultNullsSortMode) == NullsSortMode.NullsSmallest;
         return new SortedDrivingWithTieBreakMatch(provider, llt, ctx.PlanParams.Allocator, indexSearcher,
@@ -806,7 +806,10 @@ internal static partial class QueryPlanBuilder
             includeNoValue: includeNoValue,
             nullFirst: nullFirst, 
             nullIsSmallest: secondaryNullIsSmallest,
-            take: take);
+            take: take,
+            residualExec: ctx.Exec,
+            residual: residual,
+            token: ctx.Token);
     }
 
     private static (IQueryMatch[], LeafResolveInfo[]) ResolveAllSlots(QueryExecution exec, ResolutionContext walkerCtx, bool planHasBoost)

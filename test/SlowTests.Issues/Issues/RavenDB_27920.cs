@@ -321,6 +321,55 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void TwoKeyWalkTruncatesAGroupAmongTheEntriesThatPassTheResidual(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Products/ByCatPrice",
+            Maps = { "from p in docs.Products select new { p.Cat, p.Price, p.Grp }" }
+        }));
+        using (var bulk = store.BulkInsert())
+        {
+            for (int i = 0; i < 3000; i++)
+                bulk.Store(new Product { Cat = "a", Price = i, Grp = $"g{i * 7 % 3000:D4}" }, $"products/{i}");
+        }
+        Indexes.WaitForIndexing(store);
+
+        foreach (var (filter, first, step) in new[]
+                 {
+                     ("Price >= 100 order by Cat, Price as long", 100, 1),
+                     ("Price between 1100 and 1200 order by Cat, Price as long", 1100, 1),
+                     ("Price < 1000 order by Cat, Price as long desc", 999, -1),
+                     ("Price >= 2900 order by Cat, Price as long", 2900, 1),
+                     ("not Price < 100 order by Cat, Price as long", 100, 1),
+                     ("Price < 2900 order by Cat, Price as long desc", 2899, -1),
+                     ("Price < 700 order by Cat, Price as long desc", 699, -1),
+                     ("Price < 778 order by Cat, Price as long desc", 777, -1)
+                 })
+        {
+            string query = $"from index 'Products/ByCatPrice' where Cat >= 'a' and {filter} limit 10";
+            var expected = Enumerable.Range(0, 10).Select(k => $"products/{first + k * step}").ToArray();
+            var scan = RunRql(store, query, "FieldSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal("FieldSortedScan", scan.Hint),
+                () => Assert.Equal(expected, scan.Ids),
+                () => Assert.Equal(expected, RunRql(store, query).Ids));
+        }
+
+        // Grp does not follow the id, so a later round brings entries that rank before the kept ones as well as after them
+        foreach (string order in new[] { "Grp", "Grp desc" })
+        {
+            string query = $"from index 'Products/ByCatPrice' where Cat >= 'a' and Price >= 100 order by Cat, {order} limit 10";
+            var scan = RunRql(store, query, "FieldSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal("FieldSortedScan", scan.Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public void TwoKeyWalkOrdersEqualKeysLikeTheBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
@@ -472,5 +521,12 @@ public class RavenDB_27920 : RavenTestBase
     private class Item
     {
         public string Id { get; set; }
+    }
+
+    private class Product
+    {
+        public string Cat { get; set; }
+        public long Price { get; set; }
+        public string Grp { get; set; }
     }
 }

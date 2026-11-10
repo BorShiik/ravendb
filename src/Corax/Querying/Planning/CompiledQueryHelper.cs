@@ -2,11 +2,13 @@ using System;
 using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using Corax.Querying.Matches;
 using Corax.Querying.Primitives;
 using Corax.Utils;
 using Sparrow;
 using Voron;
+using Voron.Data.CompactTrees;
 using Voron.Data.Containers;
 using Voron.Data.RoaringBitmaps;
 
@@ -236,29 +238,7 @@ public static class CompiledQueryHelper
                 var batch = buffer[..read];
                 ctx.EntryScanEntriesScanned += read;
 
-                Span<long> locs = containerLocs[..read];
-                searcher.ResolveEntryLocations(batch, locs);
-                locs.Sort(batch);
-                Container.GetAll(llt, locs, spans, llt.PageLocator);
-                searcher.InitializeSpecialTermsMarkers();
-
-                int validCount = 0;
-                for (int i = 0; i < read; i++)
-                {
-                    if (locs[i] == -1 || spans[i].Address == null)
-                        continue;
-                    readers[validCount] = new EntryTermsReader(llt,
-                        searcher.NullTermsMarkers, searcher.NonExistingTermsMarkers,
-                        spans[i].Address, spans[i].Length, searcher.DictionaryId,
-                        searcher.VectorFieldsMarkers, entryKey);
-                    batch[validCount] = batch[i]; // compact entry IDs in-place
-                    validCount++;
-                }
-
-                if (validCount == 0)
-                    continue;
-
-                int passed = predicate(exec, readers.AsSpan(0, validCount), buffer[..validCount], Span<int>.Empty);
+                int passed = FilterBatch(searcher, exec, predicate, batch, containerLocs, spans, readers, entryKey);
                 ctx.EntryScanEntriesPassed += passed;
                 var passedBuffer = batch[..passed];
                 passedBuffer.Sort();
@@ -278,5 +258,61 @@ public static class CompiledQueryHelper
             ArrayPool<EntryTermsReader>.Shared.Return(readers, clearArray: true);
             ctx.EntryScanTiming = Stopwatch.GetTimestamp() - startTick;
         }
+    }
+
+    /// <summary>Moves the entries of one batch (sorted ascending) that pass the residual predicate to its front, in their order, and returns their count.</summary>
+    public static unsafe int FilterSortedEntries(IndexSearcher searcher, QueryExecution exec, ResidualScanIlEmitter.ResidualScanPredicate predicate,
+        Span<long> entries, CancellationToken token)
+    {
+        Debug.Assert(entries.Length <= QueryPrimitives.EntryScanBatchSize);
+        token.ThrowIfCancellationRequested();
+        if (entries.IsEmpty)
+            return 0;
+
+        Span<long> containerLocs = stackalloc long[QueryPrimitives.EntryScanBatchSize];
+        Span<UnmanagedSpan> spans = stackalloc UnmanagedSpan[QueryPrimitives.EntryScanBatchSize];
+        var readers = ArrayPool<EntryTermsReader>.Shared.Rent(QueryPrimitives.EntryScanBatchSize);
+        var llt = searcher.Transaction.LowLevelTransaction;
+        var entryKey = llt.AcquireCompactKey();
+        try
+        {
+            int passed = FilterBatch(searcher, exec, predicate, entries, containerLocs, spans, readers, entryKey);
+            entries[..passed].Sort();
+            return passed;
+        }
+        finally
+        {
+            llt.ReleaseCompactKey(ref entryKey);
+            ArrayPool<EntryTermsReader>.Shared.Return(readers, clearArray: true);
+        }
+    }
+
+    // Evaluates the predicate over a batch; the entries that pass end up at the front of the batch, in container order
+    private static unsafe int FilterBatch(IndexSearcher searcher, QueryExecution exec, ResidualScanIlEmitter.ResidualScanPredicate predicate, Span<long> batch,
+        Span<long> containerLocs, Span<UnmanagedSpan> spans, EntryTermsReader[] readers, CompactKey entryKey)
+    {
+        var llt = searcher.Transaction.LowLevelTransaction;
+        int read = batch.Length;
+
+        Span<long> locs = containerLocs[..read];
+        searcher.ResolveEntryLocations(batch, locs);
+        locs.Sort(batch);
+        Container.GetAll(llt, locs, spans, llt.PageLocator);
+        searcher.InitializeSpecialTermsMarkers();
+
+        int validCount = 0;
+        for (int i = 0; i < read; i++)
+        {
+            if (locs[i] == -1 || spans[i].Address == null)
+                continue;
+            readers[validCount] = new EntryTermsReader(llt,
+                searcher.NullTermsMarkers, searcher.NonExistingTermsMarkers,
+                spans[i].Address, spans[i].Length, searcher.DictionaryId,
+                searcher.VectorFieldsMarkers, entryKey);
+            batch[validCount] = batch[i]; // compact entry IDs in-place
+            validCount++;
+        }
+
+        return validCount == 0 ? 0 : predicate(exec, readers.AsSpan(0, validCount), batch[..validCount], Span<int>.Empty);
     }
 }
