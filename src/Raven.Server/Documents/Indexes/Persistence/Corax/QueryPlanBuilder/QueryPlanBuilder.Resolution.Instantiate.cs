@@ -187,10 +187,20 @@ internal static partial class QueryPlanBuilder
 
             if (residualCount == 0)
             {
-                // No residual filter: compound(f1,f2)is walked in ORDER BY order and emitted directly - best option
-                entriesToScan = Math.Min(drivingCardinality, ctx.BuilderParams.Query.PageSize); // for diagnostics only
-                reason = "no residual filter — sorted walk is unconditionally cheaper than build-bitmap-then-sort";
-                return true;
+                // No residual filter: compound(f1,f2) is walked in ORDER BY order and fills the page itself, after reading the rows an offset
+                // skips, so an offset is priced below
+                if (ctx.BuilderParams.Query.Start == 0)
+                {
+                    entriesToScan = Math.Min(drivingCardinality, ctx.BuilderParams.Query.PageSize); // for diagnostics only
+                    reason = "no residual filter — sorted walk is unconditionally cheaper than build-bitmap-then-sort";
+                    return true;
+                }
+
+                // the walk's take, as ConstructCompoundField resolves it: the statistics count the range, so they don't make the walk read it all
+                int take = ResolveSortedScanTake(ctx.BuilderParams, knownTotal: CanResolveKnownTotal(ctx.BuilderParams) ? 0 : -1);
+                entriesToScan = take == global::Corax.Constants.IndexSearcher.TakeAll ? drivingCardinality : Math.Min(drivingCardinality, take);
+                bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher));
+                return IsDirectScanCostEffective(entriesToScan, bitmapCost, entriesToScan, passRate: 1.0, ctx.WantTimings, unboundedReason: null, out reason);
             }
 
             // Residual present: read each entry's fields for the residual, may over-scan

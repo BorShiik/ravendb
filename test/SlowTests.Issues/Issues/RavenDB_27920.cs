@@ -872,6 +872,24 @@ public class RavenDB_27920 : RavenTestBase
         Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, page.Ids);
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundWalkWithoutAResidualPricesTheSkippedRows(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        SeedProducts(store);
+
+        // the walk reads the keys of the rows the offset skips before it fills the page; the statistics count the range, so they don't make it read more
+        foreach (var statistics in new[] { false, true })
+        foreach (var (offset, hint, first) in new[] { (20, "CompoundSortedScan", 20), (400, "BitmapPipeline", 800) })
+        {
+            var page = RunRql(store, $"from index 'Products/Compound' where Cat = 'a' order by Price as long limit 5 offset {offset}", statistics: statistics);
+            RavenTestHelper.AssertAll(() => $"offset {offset}, statistics: {statistics}",
+                () => Assert.Equal(hint, page.Hint),
+                () => Assert.Equal(Enumerable.Range(first, 5).Select(i => $"products/{i}"), page.Ids));
+        }
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })
@@ -989,7 +1007,7 @@ public class RavenDB_27920 : RavenTestBase
         return (ids, hint, entryScanAt);
     }
 
-    private static (string[] Ids, string Hint) RunRql(IDocumentStore store, string rql, string strategy = null)
+    private static (string[] Ids, string Hint) RunRql(IDocumentStore store, string rql, string strategy = null, bool statistics = false)
     {
         using var session = store.OpenSession();
         var query = session.Advanced.RawQuery<Item>($"{rql} include timings()")
@@ -999,6 +1017,8 @@ public class RavenDB_27920 : RavenTestBase
             query = query.AddParameter("rvn_corax_strategy", strategy);
         if (strategy == "BitmapPipeline")
             query = query.AddParameter("rvn_corax_entry_scan", -1L); // the reference checks no clause per document
+        if (statistics)
+            query = query.Statistics(out _);
 
         var ids = query.ToList().Select(x => x.Id).ToArray();
         string hint = null;
