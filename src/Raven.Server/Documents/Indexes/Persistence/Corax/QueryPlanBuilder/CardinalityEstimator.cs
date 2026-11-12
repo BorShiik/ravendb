@@ -10,18 +10,19 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax.QueryPlanBuilder;
 
 internal static class CardinalityEstimator
 {
-    // How many entries pass the clause. Estimate sizes a negated clause by the operand it removes, the work the bitmap does,
-    // except NotEquals, which is already estimated as its complement.
+    // How many entries pass the clause, -1 when the clause has no estimate. Estimate sizes a negated clause by the operand it removes,
+    // the work the bitmap does, except NotEquals, which is already estimated as its complement.
     public static long EstimatePassing(ClauseExecution e, long numberOfEntries)
     {
         RuntimeHelpers.EnsureSufficientExecutionStack();
+        // a null IN value or a 'NULL' bound also reads the null posting list, which the estimate leaves out
+        bool missesNulls = e.HasNullTerm || e.SentinelRewriteType == ClauseType.GreaterThanOrEqual;
         if (e.IsNegated && e.ClauseType != ClauseType.NotEquals)
         {
-            // The complement is a lower bound only of an operand estimated from above. A group may hold a negation, a sampled range is
-            // extrapolated, and a null IN value or a 'NULL' bound adds the null posting list the estimate leaves out, so these count
-            // one entry, as does an empty complement: the gates read 0 as no estimate.
-            bool unbounded = e.ClauseType is ClauseType.OrGroup or ClauseType.AndGroup || e.RangeEstimate is { IsExact: false } || e.HasNullTerm ||
-                             e.SentinelRewriteType == ClauseType.GreaterThanOrEqual;
+            // The complement is a lower bound only of an operand estimated from above. A sampled range is
+            // extrapolated, and an operand that misses the nulls is estimated low, so these count one entry, as does an empty complement:
+            // a lower bound of 0 does not mean that nothing passes.
+            bool unbounded = e.RangeEstimate is { IsExact: false } || missesNulls;
             return unbounded ? 1 : Math.Max(1, numberOfEntries - e.Cardinality);
         }
 
@@ -35,14 +36,16 @@ internal static class CardinalityEstimator
             case ClauseType.AndGroup:
                 bool isOr = e.ClauseType == ClauseType.OrGroup;
                 long passing = isOr ? 0 : numberOfEntries;
+                bool anyUnknown = false;
                 foreach (ClauseExecution sub in e.SubExecutions)
                 {
                     long subPassing = EstimatePassing(sub, numberOfEntries);
-                    passing = isOr ? passing + subPassing : Math.Min(passing, subPassing);
+                    anyUnknown |= subPassing < 0;
+                    passing = isOr ? passing + Math.Max(0, subPassing) : Math.Min(passing, subPassing);
                 }
-                return Math.Min(passing, numberOfEntries);
+                return passing == 0 && anyUnknown ? -1 : Math.Min(passing, numberOfEntries);
             default:
-                return e.Cardinality;
+                return e.Cardinality == 0 && missesNulls ? -1 : e.Cardinality;
         }
     }
 

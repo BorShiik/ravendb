@@ -206,12 +206,13 @@ public class RavenDB_27920 : RavenTestBase
                      ("not Age > 600", ["items/11", "items/12", "items/13", "items/14", "items/15"]),
                      ("not Bucket in (null, 1)", ["items/11", "items/12", "items/13", "items/14", "items/15"]),
                      ("not Tags between 'c' and 'NULL'", ["items/11", "items/12", "items/15", "items/16", "items/17"]),
-                     ("not (exists(Bucket) and (Bucket = 5 or true))", [])
+                     ("not (Bucket != 1000 and (Bucket = 5 or true))", [])
                  })
         {
             var result = RunRql(store, $"from index 'Items/ByAgeBucket' where Age > 10 and {negated} order by Age as long limit 5");
-            Assert.True(result.Hint == "BitmapPipeline", $"{negated}: {result.Hint}");
-            Assert.Equal(page, result.Ids);
+            RavenTestHelper.AssertAll(() => negated,
+                () => Assert.Equal("BitmapPipeline", result.Hint),
+                () => Assert.Equal(page, result.Ids));
         }
 
         // `or true` passes every entry, so the walk fills the page at once
@@ -810,6 +811,44 @@ public class RavenDB_27920 : RavenTestBase
         var scan = Run(store, sorted, empty, ("rvn_corax_strategy", "FieldSortedScan"));
         Assert.Equal("FieldSortedScan", scan.Hint);
         Assert.Equal(bitmap.Ids, scan.Ids);
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void SortedScanCostGateLeavesAResidualThatPassesNothingToTheBitmap(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        Seed(store);
+        using var products = GetDocumentStore(options);
+        SeedProducts(products);
+
+        // no Score is above 1000 and no Grp is 'zzz', so a walk would read the whole driving range for no row, even a short one;
+        // the empty complements of exists() and of a null IN value are only lower bounds and count one entry, as before
+        foreach (var (target, rql) in new[]
+                 {
+                     (store, "from index 'Items/ByAll' where Age > 10 and Score > 1000 order by Age as long limit 5"),
+                     (products, "from index 'Products/Compound' where Cat = 'a' and Grp = 'zzz' order by Price as long limit 5"),
+                     (products, "from index 'Products/ByCatPrice' where Price >= 1990 and Grp = 'zzz' order by Price as long limit 5"),
+                     (products, "from index 'Products/ByCatPrice' where Price >= 1990 and not exists(Grp) order by Price as long limit 5"),
+                     (products, "from index 'Products/ByCatPrice' where Price >= 0 and (Grp in (null) or not exists(Grp)) order by Price as long limit 5")
+                 })
+        {
+            var page = RunRql(target, rql);
+            RavenTestHelper.AssertAll(() => rql,
+                () => Assert.Equal("BitmapPipeline", page.Hint),
+                () => Assert.Empty(page.Ids));
+        }
+
+        // no name sorts above 'zzz', but the null name of items/e4 passes these, so their empty estimates keep the walk
+        foreach (string where in new[] { "Name in (null)", "Name between 'zzz' and 'NULL'", "(Name in (null) or Tag = 'zzz')" })
+        {
+            string rql = $"from index 'Items/ByAll' where Age > 10 and {where} order by Age as long limit 5";
+            var page = RunRql(store, rql);
+            RavenTestHelper.AssertAll(() => rql,
+                () => Assert.Equal("FieldSortedScan", page.Hint),
+                () => Assert.Equal(["items/e4"], page.Ids),
+                () => Assert.Equal(page.Ids, RunRql(store, rql, "BitmapPipeline").Ids));
+        }
     }
 
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)

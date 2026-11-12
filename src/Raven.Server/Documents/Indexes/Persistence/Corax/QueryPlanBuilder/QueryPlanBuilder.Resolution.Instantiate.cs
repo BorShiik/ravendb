@@ -294,7 +294,7 @@ internal static partial class QueryPlanBuilder
         static long PassingEntries(ClauseExecution exec, IndexSearcher indexSearcher)
         {
             long passing = CardinalityEstimator.EstimatePassing(exec, indexSearcher.NumberOfEntries);
-            return passing > 0 ? passing : indexSearcher.NumberOfEntries;
+            return passing >= 0 ? passing : indexSearcher.NumberOfEntries;
         }
 
         static long SurvivorSortCost(long survivors)
@@ -316,16 +316,19 @@ internal static partial class QueryPlanBuilder
                 minResidual = Math.Min(PassingEntries(exec, indexSearcher), minResidual);
             }
 
-            if (minResidual > 0 && minResidual < indexSearcher.NumberOfEntries)
+            if (minResidual == 0)
+            {
+                passRate = 0; // nothing passes: the walk would read its whole range for no row, the bitmap stops at the empty clause
+                return long.MaxValue;
+            }
+
+            if (minResidual < indexSearcher.NumberOfEntries)
             {
                 // here we check what is the pass rate of the most selective residual clause (i.e, 1% of entries matched, etc)
                 passRate = (double)minResidual / indexSearcher.NumberOfEntries; // pass rate is (0 .. 1) - ensured by if above
-                if (passRate > 0)
-                {
-                    // if the pass rate is 1%, we have to scan through 10_000 entries to get 100, inflate the results by the pass rate to esitmate.
-                    // Getting 10 results with 1% pass rate means - scan 1,000 entries
-                    return (long)(resultsWanted / passRate);
-                }
+                // if the pass rate is 1%, we have to scan through 10_000 entries to get 100, inflate the results by the pass rate to esitmate.
+                // Getting 10 results with 1% pass rate means - scan 1,000 entries
+                return (long)(resultsWanted / passRate);
             }
             return resultsWanted;
         }
