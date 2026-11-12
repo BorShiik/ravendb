@@ -63,6 +63,66 @@ public class RavenDB_27920 : RavenTestBase
     }
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void NegatedExactNotEqualsIsAnEquality(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        Seed(store);
+
+        // not exact(F != v) is F = v: alone, inside a negated group (not A or F = v) and inside an OR group
+        var tag3 = Enumerable.Range(0, 10).Select(i => $"items/{i * 10 + 3}").ToArray();
+        foreach (var (where, expected) in new (string, string[])[]
+                 {
+                     ("where Age >= 0 and not exact(Tag != '3')", tag3),
+                     ("where startsWith(Name, 'n0') and not (Age >= 0 and exact(Tag != '3'))", tag3),
+                     ("where Age >= 0 and (Tag = '3' or not exact(Name != 'n014'))", [.. tag3, "items/14"])
+                 })
+        {
+            int gate = Enumerable.Range(0, 16).FirstOrDefault(g => Run(store, where, "rvn_corax_entry_scan", (long)g).EntryScanAt == g, -1);
+            RavenTestHelper.AssertAll(() => where,
+                () => Assert.Equal(expected.Order(), RunRql(store, $"from index 'Items/ByAll' {where}").Ids.Order()),
+                () => Assert.Equal(expected.Order(), RunRql(store, $"from index 'Items/ByAll' {where}", "BitmapPipeline").Ids.Order()),
+                () => Assert.True(gate >= 0, "the entry scan has no gate for this query"),
+                () => Assert.Equal(expected.Order(), Run(store, where, "rvn_corax_entry_scan", (long)gate).Ids.Order()));
+        }
+
+        var walk = RunRql(store, "from index 'Items/ByAll' where Age >= 0 and (Tag = '3' or not exact(Name != 'n014')) order by Age as long", "FieldSortedScan");
+        Assert.Equal("FieldSortedScan", walk.Hint);
+        Assert.Equal(new[] { 3, 13, 14, 23, 33, 43, 53, 63, 73, 83, 93 }.Select(i => $"items/{i}"), walk.Ids);
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+    public void NegatedWrapperOverAGroupNegatesTheGroup(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        Seed(store);
+
+        // items/14 is the one document with Name n014 and Tag 4; every edge document has Tag 4
+        var numbered = Enumerable.Range(0, 100).ToArray();
+        var edges = Enumerable.Range(0, 10).Select(k => $"items/e{k}").ToArray();
+        string[] ageAtLeast0 = [.. Items(numbered), "items/e2", "items/e3", "items/e4", "items/e5", "items/e7", "items/e8", "items/e9"];
+        string[] allButItem14 = ageAtLeast0.Except(["items/14"]).ToArray();
+        foreach (var (where, expected) in new (string, string[])[]
+                 {
+                     ("where Age >= 0 and not exact(Name = 'n014' and Tag = '4')", allButItem14),
+                     ("where Age >= 0 and not boost(Name = 'n014' and Tag = '4', 2)", allButItem14),
+                     ("where Age >= 0 and not when($on = true, Name = 'n014' and Tag = '4')", allButItem14),
+                     ("where Age >= 0 and not exact(Name != 'n014' and Tag = '4')", [.. Items(numbered.Where(i => i % 10 != 4).ToArray()), "items/14"]),
+                     ("where Tag = '3' or not exact(Name = 'n014' or Tag = '4')", Items(numbered.Where(i => i % 10 != 4).ToArray())),
+                     ("where Tag = '3' or not exact(Name = 'n014' and Tag = '4')", [.. Items(numbered.Where(i => i != 14).ToArray()), .. edges]),
+                     ("where Tag = '4' and (endsWith(Name, '7') or not exact(Age > 50 and Score > 20.5))",
+                         [.. Items(4, 14, 24, 34, 44), "items/e0", "items/e1", "items/e2", "items/e3", "items/e6", "items/e7"])
+                 })
+        {
+            RavenTestHelper.AssertAll(() => where,
+                () => Assert.Equal(expected.Order(), Run(store, where, "on", true).Ids.Order()));
+        }
+
+        static string[] Items(params int[] ids) => ids.Select(i => $"items/{i}").ToArray();
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
     public void SortedQueriesOnTheFilteredFieldAgreeWithLucene(Options options)
     {
@@ -140,15 +200,12 @@ public class RavenDB_27920 : RavenTestBase
         Assert.Equal(["items/13", "items/14", "items/18", "items/19", "items/23"], overlapping.Ids);
 
         // a negation counts one passing entry when its operand's estimate is not guaranteed to bound it from above: a sampled range, a null IN value
-        // or a 'NULL' bound (both add the null posting list) and a group (Estimate counts a nested negation by its operand); a group that folds
-        // to a constant counts it exactly
+        // or a 'NULL' bound (both add the null posting list); a group that folds to a constant counts it exactly
         foreach (var (negated, page) in new (string, string[])[]
                  {
                      ("not Age > 600", ["items/11", "items/12", "items/13", "items/14", "items/15"]),
                      ("not Bucket in (null, 1)", ["items/11", "items/12", "items/13", "items/14", "items/15"]),
                      ("not Tags between 'c' and 'NULL'", ["items/11", "items/12", "items/15", "items/16", "items/17"]),
-                     ("not exact(Bucket = 5 or not Bucket > 98)", ["items/99", "items/199", "items/299", "items/399", "items/499"]),
-                     ("not exact(Bucket = 5 or not endsWith(Tags, 'z'))", []),
                      ("not (exists(Bucket) and (Bucket = 5 or true))", [])
                  })
         {

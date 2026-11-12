@@ -576,6 +576,7 @@ internal static partial class QueryPlanBuilder
                     Operator: OperatorType.And or OperatorType.Or or OperatorType.Equal or OperatorType.NotEqual
                 } =>
                     ParseExpression(NegationNormalForm(negated.Expression), walkerCtx),
+            MethodExpression method when WrappedOperand(method) >= 0 => ParseExpression(NegationNormalForm(method), walkerCtx),
             _ => ParseNegatedLeaf(negated.Expression, walkerCtx)
         };
 
@@ -599,9 +600,19 @@ internal static partial class QueryPlanBuilder
             BinaryExpression { Operator: OperatorType.NotEqual } be => 
                 new BinaryExpression(be.Left, be.Right, OperatorType.Equal),
             NegatedExpression neg => neg.Expression, // not(not(x)) == x
+            MethodExpression method when WrappedOperand(method) is >= 0 and var operand => // not exact(x) == exact(not x)
+                new MethodExpression(method.Name, new List<QueryExpression>(method.Arguments) { [operand] = NegationNormalForm(method.Arguments[operand]) }),
             _ => new NegatedExpression(expr)
         };
     }
+
+    // The argument whose answer exact(), boost() and when() hand on, -1 for any other method
+    private static int WrappedOperand(MethodExpression method) => QueryMethod.GetMethodType(method.Name.Value, throwIfNoMatch: false) switch
+    {
+        MethodType.Exact or MethodType.Boost when method.Arguments.Count > 0 => 0,
+        MethodType.When when method.Arguments.Count > 1 => 1,
+        _ => -1
+    };
 
     private static BooleanOp ParseNegatedLeaf(QueryExpression inner, ResolutionContext walkerCtx)
     {

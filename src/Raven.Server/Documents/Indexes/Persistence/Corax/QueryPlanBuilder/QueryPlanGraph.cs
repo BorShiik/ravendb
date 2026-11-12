@@ -889,7 +889,7 @@ internal static class QueryPlanGraph
                 }
             }
 
-            return inner.Count == 0 ? null : (node.Parameters.GetValueOrDefault("Negated") == "true" ? "NOT (" : "(") + string.Join(joiner, inner) + ")";
+            return inner.Count == 0 ? null : "(" + string.Join(joiner, inner) + ")";
         }
 
         if (node.Operation != ResidualOp || node.Parameters == null)
