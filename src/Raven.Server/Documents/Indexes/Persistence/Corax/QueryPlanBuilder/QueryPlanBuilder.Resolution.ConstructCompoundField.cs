@@ -37,6 +37,16 @@ internal static partial class QueryPlanBuilder
         if (analyzedPrefix.HasValue == false || analyzedPrefix.Size > byte.MaxValue) // if too long, cannot be used for compound
             return null; // fall back to bitmap
 
+        // An open BETWEEN ('*' or 'NULL') ranges from the bound it keeps; with neither bound it is exists(), which passes null and the empty
+        // string but not missing, and all three share the driving value's key with an empty field2
+        if (field2Range?.SentinelRewriteType == ClauseType.Exists)
+        {
+            if (FindKey([], analyzedPrefix.Size) != -1)
+                return null;
+            field2Range = null;
+        }
+        var field2RangeType = field2Range?.SentinelRewriteType ?? field2Range?.Clause.ClauseType;
+
         bool forward = ctx.OrderByFields[0].Ascending;
 
         bool usedCompositeRange = false;
@@ -110,9 +120,10 @@ internal static partial class QueryPlanBuilder
                 return null;
 
             // The driving value's key with an empty field2 (null, missing, empty string) may lie inside the range and is skipped by its id.
-            // The empty string is a real value, so a string range that may hold it is left to the bitmap while the field has one.
+            // The empty string is a real value, so a string range that may hold it is left to the bitmap while the field has one, and so is
+            // a range up to 'NULL', which holds null.
             emptyField2TermId = FindKey([], analyzedPrefix.Size);
-            if (emptyField2TermId != -1 && RangeMayHoldEmptyString(ref context, field2Meta))
+            if (emptyField2TermId != -1 && (field2Range.SentinelRewriteType == ClauseType.GreaterThanOrEqual || RangeMayHoldEmptyString(ref context, field2Meta)))
                 return null;
 
             // Every key inside the range starts with the driving value's bytes P: the value's own keys, and the keys of another value
@@ -123,9 +134,9 @@ internal static partial class QueryPlanBuilder
             int firstLow = firstBytes.IndexOf(true), firstHigh = firstBytes.LastIndexOf(true);
             // the tree reads a key that ends in 0x00, or in 0x00 and then 0x01 bytes, as if it went on with another 0x01, so an open low ends
             // at the first byte itself, and only at a byte of 2 or more
-            if (field2Range.Clause.ClauseType is ClauseType.LessThan or ClauseType.LessThanOrEqual && firstLow > 1)
+            if (field2RangeType is ClauseType.LessThan or ClauseType.LessThanOrEqual && firstLow > 1)
                 lowSlice = PrefixWith(ref context, (byte)firstLow, 0);
-            if (field2Range.Clause.ClauseType is ClauseType.GreaterThan or ClauseType.GreaterThanOrEqual && firstHigh < byte.MaxValue)
+            if (field2RangeType is ClauseType.GreaterThan or ClauseType.GreaterThanOrEqual && firstHigh < byte.MaxValue)
                 highSlice = PrefixWith(ref context, (byte)firstHigh, sizeof(long));
 
             int p = analyzedPrefix.Size;
@@ -140,7 +151,7 @@ internal static partial class QueryPlanBuilder
 
         IQueryMatch BuildCompositeRangeMatch(Slice low, Slice high)
         {
-            return field2Range.Clause.ClauseType switch
+            return field2RangeType switch
             {
                 ClauseType.GreaterThan => indexSearcher.RangeBuilder<Range.Exclusive, Range.Inclusive>(compoundFieldMeta, low, high, forward, emptyField2TermId),
                 ClauseType.LessThan => indexSearcher.RangeBuilder<Range.Inclusive, Range.Exclusive>(compoundFieldMeta, low, high, forward, emptyField2TermId),
@@ -326,7 +337,7 @@ internal static partial class QueryPlanBuilder
             if (field2Range.PackedParamValue.ValueType != PackedParam.TypeString)
                 return false;
 
-            if (field2Range.Clause.ClauseType is ClauseType.GreaterThan or ClauseType.GreaterThanOrEqual or ClauseType.Between &&
+            if (field2RangeType is ClauseType.GreaterThan or ClauseType.GreaterThanOrEqual or ClauseType.Between &&
                 context.Exec.StringValues[field2Range.PackedParamValue.Param1] is { Length: > 0 } low && low[0] > Constants.EmptyString[0])
                 return false; // the empty string sorts below this low bound
 
@@ -364,7 +375,7 @@ internal static partial class QueryPlanBuilder
             directScan.DrivingTreeName = compoundFieldName;
             directScan.DrivingClause = $"{field1Name} = '{field1ValueStr}'";
             directScan.SeekBound = usedCompositeRange
-                ? $"'{field1ValueStr}' + {field2Range.Clause.FieldName} {field2Range.Clause.ClauseType} (composite range)"
+                ? $"'{field1ValueStr}' + {field2Range.Clause.FieldName} {field2RangeType} (composite range)"
                 : $"'{field1ValueStr}' (prefix, validatePostfixLen)";
             directScan.Direction = context.OrderByFields[0].Ascending ? "Forward" : "Backward";
             directScan.ResidualDescription = context.Exec.Plan.CompoundFieldResidualSet?.Predicates is { } cfr ? 

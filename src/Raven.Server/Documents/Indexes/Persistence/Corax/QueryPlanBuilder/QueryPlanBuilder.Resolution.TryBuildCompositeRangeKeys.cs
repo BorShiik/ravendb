@@ -21,12 +21,13 @@ internal static partial class QueryPlanBuilder
         if (TryGetCompoundFieldEncoding(ref ctx, sortFieldName, field2Packed, field2Packed.Param1, out var encLow) == false)
             return false;
         
+        var rangeType = field2Exec.SentinelRewriteType ?? field2Exec.Clause.ClauseType;
         CompoundFieldEncoding encHigh = default;
-        if (field2Exec.Clause.ClauseType is ClauseType.Between && 
+        if (rangeType is ClauseType.Between &&
             TryGetCompoundFieldEncoding(ref ctx, sortFieldName, field2Packed, field2Packed.Param2, out encHigh) == false)
             return false;
 
-        var (lowEnc, highEnc, lowSuffixSize, highSuffixSize) = field2Exec.Clause.ClauseType switch
+        var (lowEnc, highEnc, lowSuffixSize, highSuffixSize) = rangeType switch
         {
             // e.g. WHERE field1 = X AND field2 BETWEEN Y AND Z ORDER BY field1, field2
             ClauseType.Between => ((CompoundFieldEncoding?)encLow, (CompoundFieldEncoding?)encHigh, encLow.Size, encHigh.Size),

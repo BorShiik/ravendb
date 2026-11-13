@@ -689,6 +689,67 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeOfAnOpenBetweenUsesTheBoundItKeeps(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Items/ByTagName", Maps = { "from d in docs.Items select new { d.Tag, d.Name }" }, CompoundFields = [["Tag", "Name"]]
+        }));
+        var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 0; i < 200; i++)
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Tag"] = "ab"[i % 2].ToString(), ["Name"] = $"n{i / 2:D3}" }, meta);
+            commands.Put("items/b-null", null, new Dictionary<string, object> { ["Tag"] = "b", ["Name"] = null }, meta);
+            commands.Put("items/b-missing", null, new Dictionary<string, object> { ["Tag"] = "b" }, meta);
+            // their keys continue the bytes of 'a' below and above every Name, so the walk of 'a' ends an open side at the first byte of the Names
+            commands.Put("items/ab", null, new Dictionary<string, object> { ["Tag"] = "ab", ["Name"] = "n001" }, meta);
+            commands.Put("items/az", null, new Dictionary<string, object> { ["Tag"] = "az", ["Name"] = "n001" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        // '*' and 'NULL' leave a BETWEEN the bound it keeps, or none (exists()). The reference spells the filter out: the bitmap seeks a
+        // descending sort from the second bound of a BETWEEN (RavenDB-27813).
+        foreach (var (where, reference) in new[]
+                 {
+                     ("Tag = 'a' and Name between '*' and 'n050'", "Tag = 'a' and Name <= 'n050'"),
+                     ("Tag = 'a' and Name between 'n050' and 'NULL'", "Tag = 'a' and (Name >= 'n050' or Name = null)"),
+                     ("Tag = 'a' and Name between '*' and 'NULL'", "Tag = 'a' and exists(Name)"),
+                     ("Tag = 'b' and Name between '*' and 'n050'", "Tag = 'b' and Name <= 'n050'")
+                 })
+        foreach (string order in new[] { "Name", "Name desc" })
+            AssertRows(where, reference, order, "CompoundSortedScan");
+
+        AssertRows("Tag = 'a' and Name between $lo and $hi", "Tag = 'a' and Name <= 'n050'", "Name", "CompoundSortedScan", ("lo", "*"), ("hi", "n050"));
+
+        // the key of 'b' with no Name holds a null and a missing Name, and only the null one passes a 'NULL' bound and exists()
+        AssertRows("Tag = 'b' and Name between 'n050' and 'NULL'", "Tag = 'b' and (Name >= 'n050' or Name = null)", "Name", "BitmapPipeline");
+        AssertRows("Tag = 'b' and Name between '*' and 'NULL'", "Tag = 'b' and exists(Name)", "Name desc", "BitmapPipeline");
+
+        // an empty Name passes '*', and its key is the key with no Name
+        using (var commands = store.Commands())
+        {
+            commands.Put("items/c-empty", null, new Dictionary<string, object> { ["Tag"] = "c", ["Name"] = "" }, meta);
+            commands.Put("items/c-name", null, new Dictionary<string, object> { ["Tag"] = "c", ["Name"] = "n001" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        AssertRows("Tag = 'c' and Name between '*' and 'n050'", "Tag = 'c' and Name <= 'n050'", "Name", "BitmapPipeline");
+
+        void AssertRows(string where, string reference, string order, string hint, params (string Name, object Value)[] parameters)
+        {
+            string query = $"from index 'Items/ByTagName' where {where} order by {order}";
+            var scan = RunRql(store, query, "CompoundSortedScan", parameters: parameters);
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(hint, scan.Hint),
+                () => Assert.Equal(hint, RunRql(store, query, parameters: parameters).Hint),
+                () => Assert.Equal(RunRql(store, $"from index 'Items/ByTagName' where {reference} order by {order}", "BitmapPipeline").Ids, scan.Ids));
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public void CompoundWalkLeavesAComponentOfMixedTypesToTheBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
@@ -1064,29 +1125,14 @@ public class RavenDB_27920 : RavenTestBase
         Indexes.WaitForIndexing(store);
     }
 
-    private static (string[] Ids, string Hint, int EntryScanAt) Run(IDocumentStore store, string where, string parameter, object value) => Run(store, where, (parameter, value));
+    private static (string[] Ids, string Hint, int EntryScanAt, long Total) Run(IDocumentStore store, string where, string parameter, object value) =>
+        Run(store, where, (parameter, value));
 
-    private static (string[] Ids, string Hint, int EntryScanAt) Run(IDocumentStore store, string where, params (string Name, object Value)[] parameters)
-    {
-        using var session = store.OpenSession();
-        var query = session.Advanced.RawQuery<Item>($"from index 'Items/ByAll' {where} include timings()")
-            .NoCaching()
-            .Timings(out QueryTimings timings);
-        foreach (var (name, value) in parameters)
-            query = query.AddParameter(name, value);
-        var ids = query.ToList().Select(x => x.Id).ToArray();
+    private static (string[] Ids, string Hint, int EntryScanAt, long Total) Run(IDocumentStore store, string where, params (string Name, object Value)[] parameters) =>
+        RunRql(store, $"from index 'Items/ByAll' {where}", parameters: parameters);
 
-        var plan = (QueryInspectionNode)timings.QueryPlan;
-        string hint = null;
-        Find(plan, "CompiledQuery")?.Parameters?.TryGetValue("OptimizationHint", out hint);
-        int entryScanAt = -1;
-        var entryScan = Find(plan, "EntryScan");
-        if (entryScan?.Parameters != null && entryScan.Parameters.TryGetValue("Taken", out var taken) && taken == "True")
-            int.TryParse(entryScan.Parameters["SwitchedAfterClauses"], out entryScanAt);
-        return (ids, hint, entryScanAt);
-    }
-
-    private static (string[] Ids, string Hint, long Total) RunRql(IDocumentStore store, string rql, string strategy = null, bool statistics = false)
+    private static (string[] Ids, string Hint, int EntryScanAt, long Total) RunRql(IDocumentStore store, string rql, string strategy = null, bool statistics = false,
+        params (string Name, object Value)[] parameters)
     {
         using var session = store.OpenSession();
         var query = session.Advanced.RawQuery<Item>($"{rql} include timings()")
@@ -1096,14 +1142,21 @@ public class RavenDB_27920 : RavenTestBase
             query = query.AddParameter("rvn_corax_strategy", strategy);
         if (strategy == "BitmapPipeline")
             query = query.AddParameter("rvn_corax_entry_scan", -1L); // the reference checks no clause per document
+        foreach (var (name, value) in parameters)
+            query = query.AddParameter(name, value);
         QueryStatistics stats = null;
         if (statistics)
             query = query.Statistics(out stats);
 
         var ids = query.ToList().Select(x => x.Id).ToArray();
+        var plan = (QueryInspectionNode)timings.QueryPlan;
         string hint = null;
-        Find((QueryInspectionNode)timings.QueryPlan, "CompiledQuery")?.Parameters?.TryGetValue("OptimizationHint", out hint);
-        return (ids, hint, stats?.TotalResults ?? -1);
+        Find(plan, "CompiledQuery")?.Parameters?.TryGetValue("OptimizationHint", out hint);
+        int entryScanAt = -1;
+        var entryScan = Find(plan, "EntryScan");
+        if (entryScan?.Parameters != null && entryScan.Parameters.TryGetValue("Taken", out var taken) && taken == "True")
+            int.TryParse(entryScan.Parameters["SwitchedAfterClauses"], out entryScanAt);
+        return (ids, hint, entryScanAt, stats?.TotalResults ?? -1);
     }
 
     private static (string Ids, long Total) RunWithStatistics(IDocumentStore store, string rql, string strategy)
