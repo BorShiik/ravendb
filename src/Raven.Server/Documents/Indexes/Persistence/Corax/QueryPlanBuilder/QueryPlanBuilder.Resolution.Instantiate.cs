@@ -245,6 +245,13 @@ internal static partial class QueryPlanBuilder
             // Residual present: scan reads scanned entry's fields and over-scans. Estimate the over-scan amount for the costs
             long drivingCard = drivingExec.GetEffectiveCardinality(indexSearcher);
             var entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCard, ResolveEffectiveScanTake(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
+            if (ctx.OrderByFields.Length == 2)
+            {
+                // the two-key walk truncates a group every max(4 * take, 1024) entries, and each round may check take / pass rate of them
+                double avgGroup = (double)drivingExec.Cardinality / Math.Max(1, drivingExec.RangeEstimate?.RangeTerms ?? 1);
+                double rounds = avgGroup / Math.Max(4 * resultsWanted, QueryPrimitives.TieBreakGroupInitialCapacity);
+                entriesToScan = Math.Max(entriesToScan, (long)Math.Min(avgGroup, rounds * entriesToScan));
+            }
 
             string unboundedReason = ctx.WantTimings ? DescribeUnboundedScanTake(ctx.BuilderParams) : null;
             return IsDirectScanCostEffective(entriesToScan, bitmapCost, resultsWanted, passRate, ctx.WantTimings, unboundedReason, out directScanReason);

@@ -394,6 +394,16 @@ public class RavenDB_27920 : RavenTestBase
                 () => Assert.Equal("FieldSortedScan", scan.Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
         }
+
+        // every truncation round of the group may check take / pass rate of its entries, so a selective residual leaves the group to the bitmap
+        foreach (var (filter, hint) in new[] { ("Price < 360", "BitmapPipeline"), ("Price < 1500", "FieldSortedScan") })
+        {
+            string query = $"from index 'Products/ByCatPrice' where Cat >= 'a' and {filter} order by Cat, Price as long desc limit 10";
+            var page = RunRql(store, query);
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(hint, page.Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, page.Ids));
+        }
     }
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
@@ -829,6 +839,7 @@ public class RavenDB_27920 : RavenTestBase
                  {
                      (store, "from index 'Items/ByAll' where Age > 10 and Score > 1000 order by Age as long limit 5"),
                      (products, "from index 'Products/Compound' where Cat = 'a' and Grp = 'zzz' order by Price as long limit 5"),
+                     (products, "from index 'Products/ByCatPrice' where Cat >= 'a' and Grp = 'zzz' order by Cat, Price as long limit 5"),
                      (products, "from index 'Products/ByCatPrice' where Price >= 1990 and Grp = 'zzz' order by Price as long limit 5"),
                      (products, "from index 'Products/ByCatPrice' where Price >= 1990 and not exists(Grp) order by Price as long limit 5"),
                      (products, "from index 'Products/ByCatPrice' where Price >= 0 and (Grp in (null) or not exists(Grp)) order by Price as long limit 5")
