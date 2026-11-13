@@ -933,6 +933,42 @@ public class RavenDB_27920 : RavenTestBase
         }
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void DescendingWalkOverAnOpenHighDoubleRangeStartsAtInfinity(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Items/ByRatio", Maps = { "from d in docs.Items select new { d.Age, Ratio = (double)d.Total / (double)d.Count }" }
+        }));
+        using (var bulk = store.BulkInsert())
+        {
+            for (int i = 0; i < 10000; i++)
+                bulk.Store(new Dictionary<string, object> { ["Age"] = (long)i, ["Total"] = 1L, ["Count"] = i % 500 == 7 ? 0L : 2L }, $"items/{i}",
+                    new MetadataAsDictionary { ["@collection"] = "Items" });
+        }
+        Indexes.WaitForIndexing(store);
+
+        // Total / 0 indexes +∞ above double.MaxValue, the open high bound: the bitmap and the ascending walk include it, and the range
+        // estimate counts it, so `Ratio > 1.5` is walked unforced
+        foreach (string where in new[] { "where Ratio > 1.5 and Age >= 0", "where Ratio > 1.5", "" })
+        foreach (string order in new[] { "Ratio as double desc", "Ratio as double" })
+        foreach (bool statistics in new[] { false, true })
+        {
+            string query = $"from index 'Items/ByRatio' {where} order by {order} limit 10";
+            var bitmap = RunRql(store, query, "BitmapPipeline", statistics);
+            foreach (string strategy in new[] { null, "FieldSortedScan" })
+            {
+                var page = RunRql(store, query, strategy, statistics);
+                RavenTestHelper.AssertAll(() => $"{query}, {strategy ?? "unforced"}, statistics: {statistics}",
+                    () => Assert.True(strategy is null || page.Hint == strategy, page.Hint),
+                    () => Assert.Equal(bitmap.Ids, page.Ids),
+                    () => Assert.Equal(bitmap.Total, page.Total));
+            }
+        }
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })
@@ -1050,7 +1086,7 @@ public class RavenDB_27920 : RavenTestBase
         return (ids, hint, entryScanAt);
     }
 
-    private static (string[] Ids, string Hint) RunRql(IDocumentStore store, string rql, string strategy = null, bool statistics = false)
+    private static (string[] Ids, string Hint, long Total) RunRql(IDocumentStore store, string rql, string strategy = null, bool statistics = false)
     {
         using var session = store.OpenSession();
         var query = session.Advanced.RawQuery<Item>($"{rql} include timings()")
@@ -1060,13 +1096,14 @@ public class RavenDB_27920 : RavenTestBase
             query = query.AddParameter("rvn_corax_strategy", strategy);
         if (strategy == "BitmapPipeline")
             query = query.AddParameter("rvn_corax_entry_scan", -1L); // the reference checks no clause per document
+        QueryStatistics stats = null;
         if (statistics)
-            query = query.Statistics(out _);
+            query = query.Statistics(out stats);
 
         var ids = query.ToList().Select(x => x.Id).ToArray();
         string hint = null;
         Find((QueryInspectionNode)timings.QueryPlan, "CompiledQuery")?.Parameters?.TryGetValue("OptimizationHint", out hint);
-        return (ids, hint);
+        return (ids, hint, stats?.TotalResults ?? -1);
     }
 
     private static (string Ids, long Total) RunWithStatistics(IDocumentStore store, string rql, string strategy)

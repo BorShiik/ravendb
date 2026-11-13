@@ -56,6 +56,10 @@ namespace Corax.Querying.Matches.TermsProviders
                 return;
             }
 
+            // The forward walk of an open high bound runs past double.MaxValue to +infinity, so the backward walk starts there
+            if (_iterator.IsForward == false && typeof(THigh) == typeof(Range.Inclusive) && typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)high).Value.AlmostEquals(double.MaxValue))
+                _high = (TVal)(object)new DoubleLookupKey(double.PositiveInfinity);
+
             PrepareKeys();
             Reset();
         }
