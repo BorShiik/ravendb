@@ -1063,6 +1063,53 @@ public class RavenDB_27920 : RavenTestBase
         Assert.Equal("BitmapPipeline", page.Hint);
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundRangeIsWalkedOnlyWhenTheOrderByComparesItsType(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Items/ByTag", Maps = { "from d in docs.Items select new { d.Tag, d.Age, d.Score, d.Name, d.At }" },
+            CompoundFields = [["Tag", "Age"], ["Tag", "Score"], ["Tag", "Name"], ["Tag", "At"]]
+        }));
+        var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 1; i <= 200; i++)
+            {
+                commands.Put($"items/{i}", null, new Dictionary<string, object>
+                {
+                    ["Tag"] = "b", ["Age"] = (long)i, ["Score"] = i + 0.5, ["Name"] = $"n{i}", ["At"] = new System.DateTime(2024, 1, 1).AddDays(i).ToString("O")
+                }, meta);
+            }
+        }
+        Indexes.WaitForIndexing(store);
+
+        // The walk returns the order of its keys, so it serves a range only when the ORDER BY compares the range's type: without 'as long'
+        // the ORDER BY compares text ('10' before '6'), alphanumeric compares the digits by value, and 'as long' cuts the fractions
+        foreach (var (query, hint) in new[]
+                 {
+                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age limit 8", "BitmapPipeline"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age desc limit 8", "BitmapPipeline"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as double limit 8", "BitmapPipeline"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as long limit 8", "BitmapPipeline"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name as alphanumeric limit 8", "BitmapPipeline"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as long limit 8", "CompoundSortedScan"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as double limit 8", "CompoundSortedScan"),
+                     ("from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name limit 8", "CompoundSortedScan"),
+                     // a date bound and an implicit ORDER BY over dates both read ticks
+                     ("from index 'Items/ByTag' where Tag = 'b' and At > '2024-01-05T00:00:00.0000000' order by At limit 8", "CompoundSortedScan")
+                 })
+        {
+            var scan = RunRql(store, query, "CompoundSortedScan");
+            RavenTestHelper.AssertAll(() => query,
+                () => Assert.Equal(hint, scan.Hint),
+                () => Assert.Equal(hint, RunRql(store, query).Hint),
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
+        }
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })

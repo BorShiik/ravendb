@@ -64,7 +64,11 @@ internal static partial class QueryPlanBuilder
                 // Single-field order (field2): the DirectScan already emits in that order, elide the wrapper and push a page-bounded Take into the scan.
                 bool canElideCompoundSort = orderByFields.Length == 1;
                 var innerMatch = ConstructCompoundField(ref ctx, walkerCtx, ctx.Exec.CompoundFieldField2Range, cfEntriesToScan, cfBitmapCost, canElideCompoundSort);
-                if (innerMatch is null) goto default;
+                if (innerMatch is null)
+                {
+                    exec.StrategyGateReason = "the compound keys can't serve these values (their types, the ORDER BY type or other values' keys in the range)";
+                    goto default;
+                }
                 exec.ActualStrategy = ExecutionStrategy.CompoundSortedScan;
                 var outer = canElideCompoundSort
                     ? innerMatch // already in field2 order; DirectScan handles Take itself

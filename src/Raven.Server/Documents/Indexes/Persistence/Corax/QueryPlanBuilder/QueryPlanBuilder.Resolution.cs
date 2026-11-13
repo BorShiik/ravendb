@@ -620,6 +620,15 @@ internal static partial class QueryPlanBuilder
         }
     }
 
+    // A walk with the sort elided returns the order of the terms it walks, so the ORDER BY has to compare the type they are written in.
+    private static bool OrderMatchesScanOrder(ParamValueType termType, MatchCompareFieldType sortFieldType) => termType switch
+    {
+        ParamValueType.Long => sortFieldType is MatchCompareFieldType.Integer,
+        ParamValueType.Double => sortFieldType is MatchCompareFieldType.Floating,
+        ParamValueType.String => sortFieldType is MatchCompareFieldType.Sequence,
+        _ => false
+    };
+
     private static bool TryCreateSimpleFieldDirectScan(ref InstantiateContext ctx, out string rejectReason)
     {
         if (ctx.OrderByFields is not { Length: > 0 })
@@ -675,19 +684,7 @@ internal static partial class QueryPlanBuilder
             return false;
         }
 
-        // The driving clause picks which terms tree we walk, and with the sort elided that walk order is the
-        // final order - so the ordering type has to match the clause's term type.
-        var sortFieldType = ctx.OrderByFields[0].FieldType;
-        var drivingTermType = ctx.Exec.SortDrivingClause.TermValueType;
-        var orderMatchesScanOrder = drivingTermType switch
-        {
-            ParamValueType.Long => sortFieldType is MatchCompareFieldType.Integer,
-            ParamValueType.Double => sortFieldType is MatchCompareFieldType.Floating,
-            ParamValueType.String => sortFieldType is MatchCompareFieldType.Sequence,
-            _ => false
-        };
-
-        if (orderMatchesScanOrder == false)
+        if (OrderMatchesScanOrder(ctx.Exec.SortDrivingClause.TermValueType, ctx.OrderByFields[0].FieldType) == false)
         {
             rejectReason = "the ORDER BY type doesn't match the term type of the filter driving the scan";
             return false;

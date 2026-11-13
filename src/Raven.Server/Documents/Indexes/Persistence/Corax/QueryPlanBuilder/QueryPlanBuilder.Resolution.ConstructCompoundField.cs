@@ -97,13 +97,17 @@ internal static partial class QueryPlanBuilder
             var field2Meta = QueryBuilderHelper.GetFieldMetadata(in context.BuilderParams, fieldName, hasBoost: false);
 
             // A component is written by the type of the document's value, so a key built from a value of one type can neither place
-            // nor tell apart the field's values of another; without a range, field2 is placed by the type the ORDER BY compares
-            int? field2Type = field2Range?.PackedParamValue.ValueType ?? context.OrderByFields[0].FieldType switch
-            {
-                MatchCompareFieldType.Sequence => PackedParam.TypeString,
-                MatchCompareFieldType.Integer or MatchCompareFieldType.Floating => PackedParam.TypeLong,
-                _ => null
-            };
+            // nor tell apart the field's values of another; without a range, field2 is placed by the type the ORDER BY compares, and a
+            // range is walked only when the ORDER BY compares the range's type, since the walk's order is the result's
+            var orderType = context.OrderByFields[0].FieldType;
+            int? field2Type = field2Range is null
+                ? orderType switch
+                {
+                    MatchCompareFieldType.Sequence => PackedParam.TypeString,
+                    MatchCompareFieldType.Integer or MatchCompareFieldType.Floating => PackedParam.TypeLong,
+                    _ => null
+                }
+                : OrderMatchesScanOrder(field2Range.TermValueType, orderType) ? field2Range.PackedParamValue.ValueType : null;
             if (field2Type is not { } type || HoldsAnotherType(field1Meta, packed.ValueType) || HoldsAnotherType(field2Meta, type))
                 return null;
 
