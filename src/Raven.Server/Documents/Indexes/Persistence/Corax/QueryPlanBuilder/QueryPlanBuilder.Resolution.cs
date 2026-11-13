@@ -584,16 +584,6 @@ internal static partial class QueryPlanBuilder
             return false;
         }
 
-        if (field2Range is null && ctx.OrderByFields is [var sortField])
-        {
-            if (sortField.MayHaveMissingEntries ||
-                ctx.PlanParams.IndexSearcher.TryGetPostingListForNull(in sortField.Field, out _))
-            {
-                rejectReason = "the sort field has null/missing values and no range filter to exclude them, so the scan would order nulls wrong";
-                return false;
-            }
-        }
-
         rejectReason = null;
         return true;
     }

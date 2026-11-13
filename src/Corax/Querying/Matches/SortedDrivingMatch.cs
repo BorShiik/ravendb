@@ -98,8 +98,8 @@ public sealed unsafe class SortedDrivingMatch : IQueryMatch, IDisposable
     /// <summary>
     /// Driven variant — merges no null or non-existing posting list, so it yields only the entries of the provider's terms. A range or
     /// equality on the sort field matches neither null nor missing values; the compound subtree of a pinned first field holds them in its
-    /// key with an empty field2, which a field2 range skips by its id, and without a field2 range TryCreateCompoundFieldMatch leaves the
-    /// walk to the bitmap while the sort field has null or missing values.
+    /// key with an empty field2, which a field2 range skips by its id, and without a field2 range the walk is left to the bitmap on every
+    /// execution while the sort field has null or missing values.
     /// </summary>
     public SortedDrivingMatch(ITermsProvider provider, LowLevelTransaction llt, ByteStringContext allocator)
     {

@@ -47,6 +47,14 @@ internal static partial class QueryPlanBuilder
             // On the cases rather than in SelectExecutionStrategy: a forced $rvn_corax_strategy skips selection.
             case ExecutionStrategy.CompoundSortedScan when orderByFields != null && compiledPlan.SortElisionDiverged == false: // no order by -> bitmap is more efficient 
             {
+                // the strategy is cached with the plan, but whether the sort field holds null and missing values changes with indexing
+                if (forced is null && exec.CompoundFieldField2Range is null && orderByFields is [var sortField] &&
+                    (sortField.MayHaveMissingEntries || ctx.PlanParams.IndexSearcher.TryGetPostingListForNull(in sortField.Field, out _)))
+                {
+                    exec.StrategyGateReason = "the sort field has null/missing values and no range filter to exclude them, so the scan would order nulls wrong";
+                    goto default;
+                }
+
                 bool cfEffective = CompoundFieldCostEffective(ref ctx, out long cfEntriesToScan, out long cfBitmapCost, out var cfReason);
                 exec.StrategyGateReason = forced is not null ? "forced via $rvn_corax_strategy" : cfReason; 
                 if (forced is null && cfEffective == false)

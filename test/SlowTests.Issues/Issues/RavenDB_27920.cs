@@ -1030,6 +1030,39 @@ public class RavenDB_27920 : RavenTestBase
         }
     }
 
+    [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void CompoundWalkWithoutARangeChecksTheNullsOfTheSortFieldOnEveryExecution(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+        {
+            Name = "Items/ByTagAge", Maps = { "from d in docs.Items select new { d.Tag, d.Age }" }, CompoundFields = [["Tag", "Age"]]
+        }));
+        var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
+        using (var commands = store.Commands())
+        {
+            for (int i = 0; i < 200; i++)
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Tag"] = "a", ["Age"] = (long)i }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        const string query = "from index 'Items/ByTagAge' where Tag = $t order by Age as long nulls last limit 5";
+        Assert.Equal("CompoundSortedScan", RunRql(store, query, parameters: [("t", "a")]).Hint);
+
+        // the plan is cached, and the walk would return first the key with no Age, which a null and a missing Age share
+        using (var commands = store.Commands())
+        {
+            commands.Put("items/null-age", null, new Dictionary<string, object> { ["Tag"] = "a", ["Age"] = null }, meta);
+            commands.Put("items/no-age", null, new Dictionary<string, object> { ["Tag"] = "a" }, meta);
+        }
+        Indexes.WaitForIndexing(store);
+
+        var page = RunRql(store, query, parameters: [("t", "a")]);
+        Assert.Equal(Enumerable.Range(0, 5).Select(i => $"items/{i}"), page.Ids);
+        Assert.Equal("BitmapPipeline", page.Hint);
+    }
+
     private static void AssertTwoKeyWalkMatchesBitmap(IDocumentStore store, string index, string order)
     {
         foreach (var filter in new[] { "", " and R != 3" })
