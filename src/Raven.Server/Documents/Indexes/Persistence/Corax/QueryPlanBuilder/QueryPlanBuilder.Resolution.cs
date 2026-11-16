@@ -490,7 +490,7 @@ internal static partial class QueryPlanBuilder
     
     // the compound writer stores null and "" alike, as an empty component, so neither can be matched there
     private static bool IsNullOrMissingValue(QueryExecution exec, PackedParam packed) =>
-        packed.IsNone || (packed.ValueType == PackedParam.TypeString && exec.StringValues[packed.Param1] is null or "");
+        packed.IsNone || (packed.ValueType == PackedParam.TypeString && exec.StringValues[packed.Param1] is null or "" or Constants.EmptyString);
 
     private static bool TryCreateCompoundExactMatch(ref InstantiateContext ctx, out string rejectReason)
     {
@@ -559,11 +559,10 @@ internal static partial class QueryPlanBuilder
         }
 
         var driving = ctx.Exec.CompoundFieldDrivingClause;
-        var field2Range = ctx.Exec.CompoundFieldField2Range;
         var execs = ctx.Exec.Executions;
         foreach (var exec in execs)
         {
-            if (ReferenceEquals(exec, driving) || ReferenceEquals(exec, field2Range))
+            if (ReferenceEquals(exec, driving))
                 continue;
             if (IsClauseBoosted(exec))
             {
@@ -590,34 +589,13 @@ internal static partial class QueryPlanBuilder
 
     private static Slice BuildField1Prefix(ref InstantiateContext ctx, string field1Name, PackedParam packed, out string field1ValueStrForIntrospection)
     {
-        var indexSearcher = ctx.PlanParams.IndexSearcher;
-        switch (packed.ValueType)
-        {
-            case PackedParam.TypeString:
-            {
-                field1ValueStrForIntrospection = ctx.Exec.StringValues[packed.Param1];
-                var field1Meta = QueryBuilderHelper.GetFieldMetadata(in ctx.BuilderParams, field1Name, hasBoost: false);
-                return ctx.Exec.GetAnalyzedSlice(indexSearcher, field1Meta, packed.Param1);
-            }
-            case PackedParam.TypeLong:
-            {
-                // skip the ToString allocation unless this is an inspected query.
-                field1ValueStrForIntrospection = ctx.WantTimings ? ctx.Exec.LongValues[packed.Param1].ToString() : null;
-                ctx.PlanParams.Allocator.Allocate(sizeof(long), out ByteString buf);
-                EncodeNumericValue(buf.ToSpan(), PackedParam.TypeLong, packed.Param1, ctx.Exec, ctx.BuilderParams.CompoundFieldNumericXorMask);
-                return new Slice(buf);
-            }
-            case PackedParam.TypeDouble:
-            {
-                field1ValueStrForIntrospection = ctx.WantTimings ? ctx.Exec.DoubleValues[packed.Param1].ToString(CultureInfo.InvariantCulture) : null;
-                ctx.PlanParams.Allocator.Allocate(sizeof(long), out ByteString buf);
-                EncodeNumericValue(buf.ToSpan(), PackedParam.TypeDouble, packed.Param1, ctx.Exec, ctx.BuilderParams.CompoundFieldNumericXorMask);
-                return new Slice(buf);
-            }
-            default:
-                field1ValueStrForIntrospection = null;
-                return default;
-        }
+        field1ValueStrForIntrospection = null;
+        if (packed.ValueType != PackedParam.TypeString)
+            return default;
+
+        field1ValueStrForIntrospection = ctx.Exec.StringValues[packed.Param1];
+        var field1Meta = QueryBuilderHelper.GetFieldMetadata(in ctx.BuilderParams, field1Name, hasBoost: false);
+        return ctx.Exec.GetAnalyzedSlice(ctx.PlanParams.IndexSearcher, field1Meta, packed.Param1);
     }
 
     // A walk with the sort elided returns the order of the terms it walks, so the ORDER BY has to compare the type they are written in.

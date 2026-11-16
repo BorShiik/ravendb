@@ -121,7 +121,8 @@ internal static partial class QueryPlanBuilder
             var match = sortFieldType switch
             {
                 MatchCompareFieldType.Integer => indexSearcher.BetweenQuery(fieldMeta, long.MinValue, long.MaxValue, forward: forward),
-                MatchCompareFieldType.Floating => indexSearcher.BetweenQuery(fieldMeta, double.MinValue, double.MaxValue, forward: forward),
+                // NaN sorts before -infinity and belongs to a full scan.
+                MatchCompareFieldType.Floating => indexSearcher.BetweenQuery(fieldMeta, double.NaN, double.PositiveInfinity, forward: forward),
                 _ => indexSearcher.ExistsQueryForSortedScan(fieldMeta, forward: forward)
             };
             return match;

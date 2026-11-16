@@ -31,16 +31,11 @@ public struct TermsRangeProvider<TLookupIterator, TLow, THigh> : ITermsProvider,
     private bool _shouldIncludeLastTerm;
     private long _endContainerId;
 
-    // A compound key is field1 + field2 + the length of field1, so the composite range of a field1 value may also hold that value's key
-    // with an empty field2, which is skipped by its id
-    private readonly long _excludedTermId;
-
-    public TermsRangeProvider(IndexSearcher indexSearcher, CompactTree tree, in FieldMetadata field, Slice low, Slice high, long excludedTermId = -1)
+    public TermsRangeProvider(IndexSearcher indexSearcher, CompactTree tree, in FieldMetadata field, Slice low, Slice high)
     {
         _indexSearcher = indexSearcher;
         _field = field;
         _tree = tree;
-        _excludedTermId = excludedTermId;
         _iterator = tree.Iterate<TLookupIterator>();
         _isForward = default(TLookupIterator).IsForward;
 
@@ -168,13 +163,7 @@ public struct TermsRangeProvider<TLookupIterator, TLow, THigh> : ITermsProvider,
         if (_isEmpty)
             return 0;
 
-        int read = _iterator.Fill(postingListIds, _endContainerId, _shouldIncludeLastTerm);
-        int excluded = _excludedTermId == -1 ? -1 : postingListIds[..read].IndexOf(_excludedTermId);
-        if (excluded < 0)
-            return read;
-
-        postingListIds[(excluded + 1)..read].CopyTo(postingListIds[excluded..]);
-        return read > 1 ? read - 1 : FillPostingListIds(postingListIds);
+        return _iterator.Fill(postingListIds, _endContainerId, _shouldIncludeLastTerm);
     }
 
     public void Reset()
@@ -262,9 +251,6 @@ public struct TermsRangeProvider<TLookupIterator, TLow, THigh> : ITermsProvider,
                     if (_shouldIncludeLastTerm == false)
                         break;
                 }
-
-                if (termId == _excludedTermId)
-                    continue;
 
                 buckets[(int)(termId & (long)TermIdMask.EnsureIsSingleMask)].Add(allocator, termId);
                 stats.Terms++;

@@ -41,12 +41,10 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
         string directScanCsharp = null, compoundCsharp = null, scanCsharp = null;
         if (scanSet.HasPredicates)
             scanSet.Compiled = ResidualScanIlEmitter.EmitDelegate(scanSet.Predicates, out scanCsharp);
-        // DirectScan / CompoundField walk the driving clause via the tree and filter every OTHER clause per-entry. Their residual set excludes the DRIVING clause,
-        // whereas the entry-scan set excludes clause[0] (the bitmap seed). Those differ whenever the driving clause is not the smallest-cardinality clause (always, for a range-driven scan).
-        // The compound walk takes only the negations the residual has always checked (!=, NOT IN, NOT ALL IN), so that negated filters
-        // bring no new queries to the compound key range, which has gaps of its own; any other negation leaves the compound walk out
-        var compoundFieldResidualSet = _exec.CompoundFieldDrivingClause is not null && _exec.Executions.Exists(HasNegationOtherThanNotEqualsOrIn) == false
-            ? BuildResidualSet(_exec.Executions, perClause, _exec.CompoundFieldDrivingClause, _exec.CompoundFieldField2Range)
+        // Tree scans enforce only their driving clause through the key. Every other clause, including a compound field2 range,
+        // is checked per entry; the bitmap entry-scan set instead excludes clause[0], its bitmap seed.
+        var compoundFieldResidualSet = _exec.CompoundFieldDrivingClause is not null
+            ? BuildResidualSet(_exec.Executions, perClause, _exec.CompoundFieldDrivingClause, skip2: null)
             : null;
         var directScanResidualSet = _exec.SortDrivingClause is not null
             ? BuildResidualSet(_exec.Executions, perClause, _exec.SortDrivingClause, skip2: null)
@@ -518,10 +516,6 @@ ref struct BuildResolver(PlanTemplate template, PlanParameters planParams, Query
 
         return new ResidualScanSet { Predicates = residuals.ToArray(), ClauseIndices = indices.ToArray() };
     }
-
-    private static bool HasNegationOtherThanNotEqualsOrIn(ClauseExecution exec) =>
-        exec.IsNegated && exec.ClauseType is not (ClauseType.NotEquals or ClauseType.In or ClauseType.AllIn) ||
-        exec.SubExecutions?.Exists(HasNegationOtherThanNotEqualsOrIn) == true;
 
     // ClauseExecution.CompareTo sorts negated clauses LAST, so first being negated means they all are
     private readonly bool CheckAllNegated() => _exec.Executions is [{ IsNegated: true }, ..];

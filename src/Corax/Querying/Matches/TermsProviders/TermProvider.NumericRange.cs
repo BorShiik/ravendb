@@ -4,7 +4,6 @@ using System.Diagnostics;
 using Corax.Indexing;
 using Corax.Mappings;
 using Corax.Querying.Matches.Meta;
-using Sparrow.Extensions;
 using Voron.Data.Lookups;
 using Voron.Util;
 using Range = Corax.Querying.Matches.Meta.Range;
@@ -38,13 +37,12 @@ namespace Corax.Querying.Matches.TermsProviders
             _low = low;
             _high = high;
 
-            //Unbounded query can skip checking range after first element (since we're taking ALL possible results from starting point)
+            // Unbounded sides can skip the final seek, except an open low double bound: NaN sorts below -infinity.
             _skipRangeCheck = _iterator.IsForward switch
             {
                 true when typeof(THigh) == typeof(Range.Inclusive) && typeof(TVal) == typeof(Int64LookupKey) && ((Int64LookupKey)(object)high).Value == long.MaxValue => true,
-                true when typeof(THigh) == typeof(Range.Inclusive) && typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)high).Value.AlmostEquals(double.MaxValue) => true,
+                true when typeof(THigh) == typeof(Range.Inclusive) && typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)high).Value == double.PositiveInfinity => true,
                 false when typeof(TLow) == typeof(Range.Inclusive) && typeof(TVal) == typeof(Int64LookupKey) && ((Int64LookupKey)(object)low).Value == long.MinValue => true,
-                false when typeof(TLow) == typeof(Range.Inclusive) && typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)low).Value.AlmostEquals(double.MinValue) => true,
                 _ => false
             };
 
@@ -55,10 +53,6 @@ namespace Corax.Querying.Matches.TermsProviders
                 _isEmpty = true;
                 return;
             }
-
-            // The forward walk of an open high bound runs past double.MaxValue to +infinity, so the backward walk starts there
-            if (_iterator.IsForward == false && typeof(THigh) == typeof(Range.Inclusive) && typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)high).Value.AlmostEquals(double.MaxValue))
-                _high = (TVal)(object)new DoubleLookupKey(double.PositiveInfinity);
 
             PrepareKeys();
             Reset();
@@ -174,14 +168,14 @@ namespace Corax.Querying.Matches.TermsProviders
         {
             string lowValue;
             if ((typeof(TVal) == typeof(Int64LookupKey) && ((Int64LookupKey)(object)_low).Value == long.MinValue) ||
-                (typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)_low).Value.AlmostEquals(double.MinValue)))
+                (typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)_low).Value == double.NegativeInfinity))
                 lowValue = null;
             else
                 lowValue = _low.ToString();
             
             string highValue;
             if ((typeof(TVal) == typeof(Int64LookupKey) && ((Int64LookupKey)(object)_high).Value == long.MaxValue) ||
-                (typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)_high).Value.AlmostEquals(double.MaxValue)))
+                (typeof(TVal) == typeof(DoubleLookupKey) && ((DoubleLookupKey)(object)_high).Value == double.PositiveInfinity))
                 highValue = null;
             else
                 highValue = _high.ToString();
@@ -260,7 +254,7 @@ namespace Corax.Querying.Matches.TermsProviders
             if (_isEmpty)
                 return 0;
 
-            // Numeric bounds are always concrete (MinValue/MaxValue for open ranges), so the estimate is always available.
+            // Numeric bounds are always concrete (infinities for open double ranges), so the estimate is always available.
             return _set.GetNumberOfEntriesInRangeEstimate(_low, lowToStart: false, high: _high, highToEnd: false);
         }
 

@@ -242,8 +242,8 @@ public class RavenDB_27920 : RavenTestBase
             Assert.Equal(Enumerable.Range(first, 5).Select(i => $"products/{i}"), page.Ids);
         }
 
-        // the same for the compound walk of Cat 'a', which checks Grp per document
-        foreach (var (offset, hint, first) in new[] { (20, "CompoundSortedScan", 40), (400, "BitmapPipeline", 1600) })
+        // without sort elision the compound walk reads every match, so both offsets use the bitmap
+        foreach (var (offset, hint, first) in new[] { (20, "BitmapPipeline", 40), (400, "BitmapPipeline", 1600) })
         {
             var page = RunRql(store, $"from index 'Products/Compound' where Cat = 'a' and Grp = 'x' order by Price as long limit 5 offset {offset}");
             Assert.Equal(hint, page.Hint);
@@ -285,12 +285,12 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundSortedScanChecksOnlyNotEqualsAndNotInPerDocument(Options options)
+    public void CompoundSortedScanChecksEveryResidualPerDocument(Options options)
     {
         using var store = GetDocumentStore(options);
         Seed(store);
         using (var commands = store.Commands())
-            commands.Delete("items/e1", null); // its string Age leaves every compound range on Age to the bitmap
+            commands.Delete("items/e1", null);
         store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
         {
             Name = "Items/ByTagAge",
@@ -299,20 +299,18 @@ public class RavenDB_27920 : RavenTestBase
         }));
         Indexes.WaitForIndexing(store);
 
-        // the compound walk checks the negations it always did, any other one keeps the query on the bitmap
-        foreach (var (negated, hint) in new[]
+        foreach (string negated in new[]
                  {
-                     ("Name != 'n014'", "CompoundSortedScan"),
-                     ("not Name in ('n024', 'n034')", "CompoundSortedScan"),
-                     ("not Tags all in ('4', 'x0')", "CompoundSortedScan"),
-                     ("not Age > 50", "BitmapPipeline"),
-                     ("(Name = 'n014' or not Age > 50)", "BitmapPipeline")
+                     "Name != 'n014'",
+                     "not Name in ('n024', 'n034')",
+                     "not Tags all in ('4', 'x0')",
+                     "not Age > 50",
+                     "(Name = 'n014' or not Age > 50)"
                  })
         {
             string query = $"from index 'Items/ByTagAge' where Tag = '4' and Age >= 0 and {negated} order by Age as long";
             var scan = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(hint, scan.Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
         }
     }
@@ -408,7 +406,7 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundRangeWalksOnlyTheKeysOfTheDrivingValue(Options options)
+    public void CompoundRangeWithAmbiguousKeysMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(
@@ -448,13 +446,11 @@ public class RavenDB_27920 : RavenTestBase
             "from index 'Items/ByTagName' where Tag = 'a' and Name > 'n010' order by Name desc",
             "from index 'Items/ByTagName' where Tag = 'a' and Name between 'n010' and 'n050' order by Name"
         };
-        // The keys of 'ab', 'aé', 'an' and of items/shorter lie inside most of these ranges, which take the bitmap then. Ages 10 to 50
-        // start with the byte 0x80, and no other value continues 'a' with it.
+        // Concatenated keys of different values may share prefixes. The range is checked per entry and must agree with the bitmap.
         foreach (var query in queries)
         {
             var scan = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(query.Contains("between 10 and 50") ? "CompoundSortedScan" : "BitmapPipeline", scan.Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
         }
 
@@ -493,7 +489,7 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundRangeIsWalkedOnlyWhenNoOtherValueHasKeysInside(Options options)
+    public void CompoundRangeWithPrefixCollisionsMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         const string map = "from o in docs.Orders select new { o.Customer, o.Amount, o.Qty, o.Title, o.Score }";
@@ -520,26 +516,20 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        foreach (var (query, hint) in new[]
-                 {
-                     // '0' is below the first byte of every amount, also below the smallest one that ends the open side
-                     ("from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount > 100 order by Amount as long", "CompoundSortedScan"),
-                     ("from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount < 150 order by Amount as long desc", "CompoundSortedScan"),
-                     // a Qty of 0 leaves the open side at the first byte 0x00, where the keys of customers/10 are
-                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/1' and Qty < 20 order by Qty as long", "BitmapPipeline"),
-                     // a Qty of 0 adds only the first bytes 0x00 and 0xFF, so no key of customers/1 continues customers/10
-                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/10' and Qty > 20 order by Qty as long", "CompoundSortedScan"),
-                     // no other value has keys inside, and the key of orders/no-qty, with no Qty, is skipped
-                     ("from index 'Orders/ByCustomerQty' where Customer = 'customers/7' and Qty < 20 order by Qty as long", "CompoundSortedScan"),
-                     ("from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < 't100' order by Title", "CompoundSortedScan"),
-                     // a double is written by its own bits, so the open side ends at its first byte 0x3F, above the '0' of customers/10
-                     ("from index 'Orders/ByCustomerScore' where Customer = 'customers/1' and Score < 150.5 order by Score as double", "CompoundSortedScan")
-                 })
+        var queries = new[]
+        {
+            "from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount > 100 order by Amount as long",
+            "from index 'Orders/ByCustomerAmount' where Customer = 'customers/1' and Amount < 150 order by Amount as long desc",
+            "from index 'Orders/ByCustomerQty' where Customer = 'customers/1' and Qty < 20 order by Qty as long",
+            "from index 'Orders/ByCustomerQty' where Customer = 'customers/10' and Qty > 20 order by Qty as long",
+            "from index 'Orders/ByCustomerQty' where Customer = 'customers/7' and Qty < 20 order by Qty as long",
+            "from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < 't100' order by Title",
+            "from index 'Orders/ByCustomerScore' where Customer = 'customers/1' and Score < 150.5 order by Score as double"
+        };
+        foreach (var query in queries)
         {
             var scan = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(hint, scan.Hint),
-                () => Assert.Equal(hint, RunRql(store, query).Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids),
                 () => Assert.Equal(RunWithStatistics(store, query + " limit 7", "BitmapPipeline"), RunWithStatistics(store, query + " limit 7", "CompoundSortedScan")));
         }
@@ -547,7 +537,6 @@ public class RavenDB_27920 : RavenTestBase
         // the key customers/10 + 11 would be a customers/1 order whose Title is '0', and no order has it
         const string fromEmpty = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/10' and Title >= '' order by Title limit 10";
         var fromEmptyScan = RunRql(store, fromEmpty, "CompoundSortedScan");
-        Assert.Equal("CompoundSortedScan", fromEmptyScan.Hint);
         using (var session = store.OpenSession())
         {
             // the reference sorts in memory, the index-order sort cannot seek to an empty string (RavenDB-27813)
@@ -563,10 +552,9 @@ public class RavenDB_27920 : RavenTestBase
 
         const string belowTitle = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/1' and Title < 't100' order by Title";
         var widened = RunRql(store, belowTitle, "CompoundSortedScan");
-        Assert.Equal("BitmapPipeline", widened.Hint);
         Assert.Equal(RunRql(store, belowTitle, "BitmapPipeline").Ids, widened.Ids);
 
-        // a bound longer than a key component can hold has no range keys, and the range is not part of the per-document check
+        // a bound longer than a key component can hold is still checked per entry
         string longBound = "t05" + new string('x', 300);
         using (var session = store.OpenSession())
         {
@@ -586,7 +574,6 @@ public class RavenDB_27920 : RavenTestBase
 
         const string longerValue = "from index 'Orders/ByCustomerTitle' where Customer = 'customers/10' and Title < 't100' order by Title";
         var inside = RunRql(store, longerValue, "CompoundSortedScan");
-        Assert.Equal("BitmapPipeline", inside.Hint);
         Assert.Equal(RunRql(store, longerValue, "BitmapPipeline").Ids, inside.Ids);
 
         // 2^-15 is written 3F 00 00 00 00 00 00 00, so its key continues the open side's end at the first byte 0x3F with zeros
@@ -596,7 +583,6 @@ public class RavenDB_27920 : RavenTestBase
 
         const string belowScore = "from index 'Orders/ByCustomerScore' where Customer = 'customers/1' and Score < 150.5 order by Score as double";
         var tiny = RunRql(store, belowScore, "CompoundSortedScan");
-        Assert.Equal("CompoundSortedScan", tiny.Hint);
         Assert.Equal(RunRql(store, belowScore, "BitmapPipeline").Ids, tiny.Ids);
     }
 
@@ -631,7 +617,7 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundRangeSeeksNoKeyThatEndsInAZeroByte(Options options)
+    public void CompoundRangeWithSpecialBytesMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(
@@ -659,13 +645,11 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        // The tree reads a key that ends in 0, or in 0 and then 1s, as if it went on with another 1, so the key of items/no-cat lies inside an
-        // open low of Cat 5 that starts with zeros (a Qty of 0 also indexes the double 0.0, whose first byte is 0)
-        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long", "BitmapPipeline");
-        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long desc", "BitmapPipeline");
-        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name", "CompoundSortedScan");
-        AssertRows("from index 'Items/ByCodeLabel' where Code = 'abc' and Label < 'z' order by Label", "BitmapPipeline");
-        AssertRows("from index 'Items/ByNumText' where Num = 0 and Text < 'z' order by Text", "CompoundSortedScan");
+        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long");
+        AssertRows("from index 'Items/ByCatQty' where Cat = 5 and Qty < 100 order by Qty as long desc");
+        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name");
+        AssertRows("from index 'Items/ByCodeLabel' where Code = 'abc' and Label < 'z' order by Label");
+        AssertRows("from index 'Items/ByNumText' where Num = 0 and Text < 'z' order by Text");
 
         // a boolean false is written as the byte 0, so the open low of 'ab' starts with zeros, and a Tag that continues 'ab' with zeros lies inside
         using (var commands = store.Commands())
@@ -675,21 +659,19 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name", "BitmapPipeline");
+        AssertRows("from index 'Items/ByTagName' where Tag = 'ab' and Name < 'n050' order by Name");
 
-        void AssertRows(string query, string hint)
+        void AssertRows(string query)
         {
             var scan = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(hint, scan.Hint),
-                () => Assert.Equal(hint, RunRql(store, query).Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
         }
     }
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundRangeOfAnOpenBetweenUsesTheBoundItKeeps(Options options)
+    public void OpenBetweenChecksItsRemainingBoundsAndMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
@@ -719,13 +701,13 @@ public class RavenDB_27920 : RavenTestBase
                      ("Tag = 'b' and Name between '*' and 'n050'", "Tag = 'b' and Name <= 'n050'")
                  })
         foreach (string order in new[] { "Name", "Name desc" })
-            AssertRows(where, reference, order, "CompoundSortedScan");
+            AssertRows(where, reference, order);
 
-        AssertRows("Tag = 'a' and Name between $lo and $hi", "Tag = 'a' and Name <= 'n050'", "Name", "CompoundSortedScan", ("lo", "*"), ("hi", "n050"));
+        AssertRows("Tag = 'a' and Name between $lo and $hi", "Tag = 'a' and Name <= 'n050'", "Name", ("lo", "*"), ("hi", "n050"));
 
         // the key of 'b' with no Name holds a null and a missing Name, and only the null one passes a 'NULL' bound and exists()
-        AssertRows("Tag = 'b' and Name between 'n050' and 'NULL'", "Tag = 'b' and (Name >= 'n050' or Name = null)", "Name", "BitmapPipeline");
-        AssertRows("Tag = 'b' and Name between '*' and 'NULL'", "Tag = 'b' and exists(Name)", "Name desc", "BitmapPipeline");
+        AssertRows("Tag = 'b' and Name between 'n050' and 'NULL'", "Tag = 'b' and (Name >= 'n050' or Name = null)", "Name");
+        AssertRows("Tag = 'b' and Name between '*' and 'NULL'", "Tag = 'b' and exists(Name)", "Name desc");
 
         // an empty Name passes '*', and its key is the key with no Name
         using (var commands = store.Commands())
@@ -735,22 +717,20 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        AssertRows("Tag = 'c' and Name between '*' and 'n050'", "Tag = 'c' and Name <= 'n050'", "Name", "BitmapPipeline");
+        AssertRows("Tag = 'c' and Name between '*' and 'n050'", "Tag = 'c' and Name <= 'n050'", "Name");
 
-        void AssertRows(string where, string reference, string order, string hint, params (string Name, object Value)[] parameters)
+        void AssertRows(string where, string reference, string order, params (string Name, object Value)[] parameters)
         {
             string query = $"from index 'Items/ByTagName' where {where} order by {order}";
             var scan = RunRql(store, query, "CompoundSortedScan", parameters: parameters);
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(hint, scan.Hint),
-                () => Assert.Equal(hint, RunRql(store, query, parameters: parameters).Hint),
                 () => Assert.Equal(RunRql(store, $"from index 'Items/ByTagName' where {reference} order by {order}", "BitmapPipeline").Ids, scan.Ids));
         }
     }
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundWalkLeavesAComponentOfMixedTypesToTheBitmap(Options options)
+    public void CompoundWalkWithMixedTypesMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(
@@ -768,8 +748,9 @@ public class RavenDB_27920 : RavenTestBase
         // the walk returns a number Age by its value, while an implicit ORDER BY compares its text
         const string byAgeText = "from index 'Items/ByTagAge' where Tag = 'b' order by Age";
         Assert.Equal(RunRql(store, byAgeText, "BitmapPipeline").Ids, RunRql(store, byAgeText).Ids);
-        // an alphanumeric ORDER BY compares the digits by their value, the walk by their bytes
-        Assert.Equal("BitmapPipeline", RunRql(store, "from index 'Items/ByTagName' where Tag = 'a' order by Name as alphanumeric", "CompoundSortedScan").Hint);
+        // an alphanumeric ORDER BY compares the digits by their value rather than their key bytes
+        const string alphanumeric = "from index 'Items/ByTagName' where Tag = 'a' order by Name as alphanumeric";
+        Assert.Equal(RunRql(store, alphanumeric, "BitmapPipeline").Ids, RunRql(store, alphanumeric, "CompoundSortedScan").Ids);
 
         const string byAge = "from index 'Items/ByTagAge' where Tag = 'a' and Age <= 30 order by Age as long";
         const string byName = "from index 'Items/ByTagName' where Tag = 'a' and Name > 'n040' order by Name";
@@ -793,9 +774,8 @@ public class RavenDB_27920 : RavenTestBase
 
             var forced = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => $"{id}: {query}",
-                () => Assert.Equal("BitmapPipeline", forced.Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, forced.Ids),
-                () => Assert.Equal("BitmapPipeline", RunRql(store, query).Hint));
+                () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, RunRql(store, query).Ids));
 
             using (var commands = store.Commands())
                 commands.Delete(id, null);
@@ -803,7 +783,6 @@ public class RavenDB_27920 : RavenTestBase
 
             var walk = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => $"without {id}: {query}",
-                () => Assert.Equal("CompoundSortedScan", walk.Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, walk.Ids));
         }
 
@@ -978,14 +957,13 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundWalkWithoutAResidualPricesTheSkippedRows(Options options)
+    public void CompoundWalkWithoutSortElisionLeavesPagedNumericWalksToBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         SeedProducts(store);
 
-        // the walk reads the keys of the rows the offset skips before it fills the page; the statistics count the range, so they don't make it read more
         foreach (var statistics in new[] { false, true })
-        foreach (var (offset, hint, first) in new[] { (20, "CompoundSortedScan", 20), (400, "BitmapPipeline", 800) })
+        foreach (var (offset, hint, first) in new[] { (20, "BitmapPipeline", 20), (400, "BitmapPipeline", 800) })
         {
             var page = RunRql(store, $"from index 'Products/Compound' where Cat = 'a' order by Price as long limit 5 offset {offset}", statistics: statistics);
             RavenTestHelper.AssertAll(() => $"offset {offset}, statistics: {statistics}",
@@ -1011,8 +989,7 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        // Total / 0 indexes +∞ above double.MaxValue, the open high bound: the bitmap and the ascending walk include it, and the range
-        // estimate counts it, so `Ratio > 1.5` is walked unforced
+        // Total / 0 indexes +∞. The open high bound is +∞ itself, so both directions include it and the range estimate counts it.
         foreach (string where in new[] { "where Ratio > 1.5 and Age >= 0", "where Ratio > 1.5", "" })
         foreach (string order in new[] { "Ratio as double desc", "Ratio as double" })
         foreach (bool statistics in new[] { false, true })
@@ -1037,24 +1014,24 @@ public class RavenDB_27920 : RavenTestBase
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
         {
-            Name = "Items/ByTagAge", Maps = { "from d in docs.Items select new { d.Tag, d.Age }" }, CompoundFields = [["Tag", "Age"]]
+            Name = "Items/ByTagName", Maps = { "from d in docs.Items select new { d.Tag, d.Name }" }, CompoundFields = [["Tag", "Name"]]
         }));
         var meta = new Dictionary<string, object> { ["@collection"] = "Items" };
         using (var commands = store.Commands())
         {
             for (int i = 0; i < 200; i++)
-                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Tag"] = "a", ["Age"] = (long)i }, meta);
+                commands.Put($"items/{i}", null, new Dictionary<string, object> { ["Tag"] = "a", ["Name"] = $"n{i:D3}" }, meta);
         }
         Indexes.WaitForIndexing(store);
 
-        const string query = "from index 'Items/ByTagAge' where Tag = $t order by Age as long nulls last limit 5";
+        const string query = "from index 'Items/ByTagName' where Tag = $t order by Name nulls last limit 5";
         Assert.Equal("CompoundSortedScan", RunRql(store, query, parameters: [("t", "a")]).Hint);
 
-        // the plan is cached, and the walk would return first the key with no Age, which a null and a missing Age share
+        // the plan is cached, and newly indexed nulls disable eliding the final string sort
         using (var commands = store.Commands())
         {
-            commands.Put("items/null-age", null, new Dictionary<string, object> { ["Tag"] = "a", ["Age"] = null }, meta);
-            commands.Put("items/no-age", null, new Dictionary<string, object> { ["Tag"] = "a" }, meta);
+            commands.Put("items/null-name", null, new Dictionary<string, object> { ["Tag"] = "a", ["Name"] = null }, meta);
+            commands.Put("items/no-name", null, new Dictionary<string, object> { ["Tag"] = "a" }, meta);
         }
         Indexes.WaitForIndexing(store);
 
@@ -1065,7 +1042,7 @@ public class RavenDB_27920 : RavenTestBase
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void CompoundRangeIsWalkedOnlyWhenTheOrderByComparesItsType(Options options)
+    public void CompoundRangeWithDifferentOrderTypesMatchesBitmap(Options options)
     {
         using var store = GetDocumentStore(options);
         store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
@@ -1086,26 +1063,22 @@ public class RavenDB_27920 : RavenTestBase
         }
         Indexes.WaitForIndexing(store);
 
-        // The walk returns the order of its keys, so it serves a range only when the ORDER BY compares the range's type: without 'as long'
-        // the ORDER BY compares text ('10' before '6'), alphanumeric compares the digits by value, and 'as long' cuts the fractions
-        foreach (var (query, hint) in new[]
-                 {
-                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age limit 8", "BitmapPipeline"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age desc limit 8", "BitmapPipeline"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as double limit 8", "BitmapPipeline"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as long limit 8", "BitmapPipeline"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name as alphanumeric limit 8", "BitmapPipeline"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as long limit 8", "CompoundSortedScan"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as double limit 8", "CompoundSortedScan"),
-                     ("from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name limit 8", "CompoundSortedScan"),
-                     // a date bound and an implicit ORDER BY over dates both read ticks
-                     ("from index 'Items/ByTag' where Tag = 'b' and At > '2024-01-05T00:00:00.0000000' order by At limit 8", "CompoundSortedScan")
-                 })
+        var queries = new[]
+        {
+            "from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age desc limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as double limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as long limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name as alphanumeric limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Age > 5 order by Age as long limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Score > 5.5 order by Score as double limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and Name > 'n' order by Name limit 8",
+            "from index 'Items/ByTag' where Tag = 'b' and At > '2024-01-05T00:00:00.0000000' order by At limit 8"
+        };
+        foreach (var query in queries)
         {
             var scan = RunRql(store, query, "CompoundSortedScan");
             RavenTestHelper.AssertAll(() => query,
-                () => Assert.Equal(hint, scan.Hint),
-                () => Assert.Equal(hint, RunRql(store, query).Hint),
                 () => Assert.Equal(RunRql(store, query, "BitmapPipeline").Ids, scan.Ids));
         }
     }

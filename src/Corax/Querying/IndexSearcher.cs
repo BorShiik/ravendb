@@ -479,26 +479,6 @@ public sealed unsafe partial class IndexSearcher : IDisposable
         return EntriesToTermsReader(treeName)?.NumberOfEntries ?? 0;
     }
 
-    /// <summary>Whether an entry holds a value of the field that is not a number, null, missing or the empty string.</summary>
-    public bool HasNonNumericValues(in FieldMetadata field)
-    {
-        // the counts below are disjoint only while every entry holds a single value
-        if (HasMultipleTermsInField(field))
-            return true;
-
-        // a value of any type writes a textual term, and null, non-existing and the empty string are terms of their own
-        long others = (EntriesToTermsReader(field.FieldName)?.NumberOfEntries ?? 0) - NumberOfEntriesWithNumericValue(field)
-                      - NumberOfDocumentsUnderSpecificTerm(field, string.Empty);
-
-        if (TryGetPostingListForNull(field, out var nullPostingListId))
-            others -= GetPostingList(nullPostingListId)?.State.NumberOfEntries ?? 0;
-
-        if (TryGetPostingListForNonExisting(field, out var nonExistingPostingListId))
-            others -= GetPostingList(nonExistingPostingListId)?.State.NumberOfEntries ?? 0;
-
-        return others > 0;
-    }
-
     /// <summary>
     /// The number of terms a pass over the terms of the field visits, as <see cref="TextualAggregation"/> does: one per
     /// distinct value, plus one for null when any entry holds a null. <see cref="GetDistinctTermCountInField"/> adds the number

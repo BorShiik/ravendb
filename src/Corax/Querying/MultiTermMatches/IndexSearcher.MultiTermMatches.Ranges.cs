@@ -106,7 +106,7 @@ public partial class IndexSearcher
         }
 
         if (typeof(TValue) == typeof(double))
-            return RangeBuilder<TLeftRange, TRightRange>(field, (double)(object)value, double.MaxValue, forward);
+            return RangeBuilder<TLeftRange, TRightRange>(field, (double)(object)value, double.PositiveInfinity, forward);
         if (typeof(TValue) == typeof(string))
         {
             var sliceValue = EncodeAndApplyAnalyzer(field, (string)(object)value);
@@ -134,7 +134,7 @@ public partial class IndexSearcher
             return RangeBuilder<TLeftRange, TRightRange>(field, long.MinValue, (long)(object)value, forward);
 
         if (typeof(TValue) == typeof(double))
-            return RangeBuilder<TLeftRange, TRightRange>(field, double.MinValue, (double)(object)value, forward);
+            return RangeBuilder<TLeftRange, TRightRange>(field, double.NegativeInfinity, (double)(object)value, forward);
 
         if (typeof(TValue) == typeof(string))
         {
@@ -165,7 +165,7 @@ public partial class IndexSearcher
     public IQueryMatch BetweenQuerySlice(in FieldMetadata field, Slice low, Slice high, bool forward = true)
         => RangeBuilder<Range.Inclusive, Range.Inclusive>(field, low, high, forward);
 
-    public IQueryMatch RangeBuilder<TLow, THigh>(in FieldMetadata field, Slice low, Slice high, bool forward, long excludedTermId = -1)
+    public IQueryMatch RangeBuilder<TLow, THigh>(in FieldMetadata field, Slice low, Slice high, bool forward)
         where TLow : struct, Range.Marker
         where THigh : struct, Range.Marker
     {
@@ -174,8 +174,8 @@ public partial class IndexSearcher
             return EmptyQueryMatch.Instance;
 
         ITermsProvider provider = forward
-            ? new TermsRangeProvider<Lookup<CompactKeyLookup>.ForwardIterator, TLow, THigh>(this, terms, field, low, high, excludedTermId)
-            : (ITermsProvider)new TermsRangeProvider<Lookup<CompactKeyLookup>.BackwardIterator, TLow, THigh>(this, terms, field, low, high, excludedTermId);
+            ? new TermsRangeProvider<Lookup<CompactKeyLookup>.ForwardIterator, TLow, THigh>(this, terms, field, low, high)
+            : (ITermsProvider)new TermsRangeProvider<Lookup<CompactKeyLookup>.BackwardIterator, TLow, THigh>(this, terms, field, low, high);
 
         return new TermsProviderMatch(provider, _transaction.LowLevelTransaction, _transaction.Allocator);
     }

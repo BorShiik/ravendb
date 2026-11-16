@@ -47,26 +47,16 @@ internal static partial class QueryPlanBuilder
             // On the cases rather than in SelectExecutionStrategy: a forced $rvn_corax_strategy skips selection.
             case ExecutionStrategy.CompoundSortedScan when orderByFields != null && compiledPlan.SortElisionDiverged == false: // no order by -> bitmap is more efficient 
             {
-                // the strategy is cached with the plan, but whether the sort field holds null and missing values changes with indexing
-                if (forced is null && exec.CompoundFieldField2Range is null && orderByFields is [var sortField] &&
-                    (sortField.MayHaveMissingEntries || ctx.PlanParams.IndexSearcher.TryGetPostingListForNull(in sortField.Field, out _)))
-                {
-                    exec.StrategyGateReason = "the sort field has null/missing values and no range filter to exclude them, so the scan would order nulls wrong";
-                    goto default;
-                }
-
-                bool cfEffective = CompoundFieldCostEffective(ref ctx, out long cfEntriesToScan, out long cfBitmapCost, out var cfReason);
+                bool canElideCompoundSort = CanElideCompoundSort(ref ctx);
+                bool cfEffective = CompoundFieldCostEffective(ref ctx, canElideCompoundSort, out long cfEntriesToScan, out long cfBitmapCost, out var cfReason);
                 exec.StrategyGateReason = forced is not null ? "forced via $rvn_corax_strategy" : cfReason; 
                 if (forced is null && cfEffective == false)
                     goto default; // if this isn't expected to benefit us, just use a bitmap query option
 
-                
-                // Single-field order (field2): the DirectScan already emits in that order, elide the wrapper and push a page-bounded Take into the scan.
-                bool canElideCompoundSort = orderByFields.Length == 1;
-                var innerMatch = ConstructCompoundField(ref ctx, walkerCtx, ctx.Exec.CompoundFieldField2Range, cfEntriesToScan, cfBitmapCost, canElideCompoundSort);
+                var innerMatch = ConstructCompoundField(ref ctx, walkerCtx, cfEntriesToScan, cfBitmapCost, canElideCompoundSort);
                 if (innerMatch is null)
                 {
-                    exec.StrategyGateReason = "the compound keys can't serve these values (their types, the ORDER BY type or other values' keys in the range)";
+                    exec.StrategyGateReason = "the compound prefix cannot represent the driving predicate exactly";
                     goto default;
                 }
                 exec.ActualStrategy = ExecutionStrategy.CompoundSortedScan;
@@ -86,7 +76,7 @@ internal static partial class QueryPlanBuilder
                     goto default;
                 }
                 // the two-key walk puts a document into the group of the first value it meets, not where the bitmap sorts it
-                if (forced is null && isFullScan && orderByFields.Length == 2 && ctx.PlanParams.IndexSearcher.HasMultipleTermsInField(orderByFields[0].Field))
+                if (isFullScan && orderByFields.Length == 2 && ctx.PlanParams.IndexSearcher.HasMultipleTermsInField(orderByFields[0].Field))
                 {
                     exec.StrategyGateReason = "the first sort field holds multiple values per document, so a two-key walk can't place a document by them";
                     goto default;
@@ -170,12 +160,12 @@ internal static partial class QueryPlanBuilder
             ctx.Plan.DecisionTrail.Record("BitmapPipeline", true, "bitmap pipeline with SortingMatch fallback");
         }
         
-        static bool CompoundFieldCostEffective(ref InstantiateContext ctx, out long entriesToScan, out long bitmapCost, out string reason)
+        static bool CompoundFieldCostEffective(ref InstantiateContext ctx, bool canElideCompoundSort, out long entriesToScan, out long bitmapCost, out string reason)
         {
             entriesToScan = 0;
             bitmapCost = 0;
             reason = null;
-            var execs  = ctx.Exec.Executions;
+            var execs = ctx.Exec.Executions;
             var drivingExec = ctx.Exec.CompoundFieldDrivingClause;
 
             if (drivingExec.PackedParamValue.IsNone)
@@ -185,40 +175,41 @@ internal static partial class QueryPlanBuilder
             }
 
             var indexSearcher = ctx.PlanParams.IndexSearcher;
-            var field2Range = ctx.Exec.CompoundFieldField2Range;
             int residualCount = 0;
             foreach (var exec in execs)
             {
                 bitmapCost += exec.GetEffectiveCardinality(indexSearcher);
-                if (exec == drivingExec || exec == field2Range)
-                    continue;
-                residualCount++;
+                if (exec != drivingExec)
+                    residualCount++;
             }
 
             long drivingCardinality = drivingExec.GetEffectiveCardinality(indexSearcher);
+            string unboundedReason = ctx.WantTimings && canElideCompoundSort == false ? "final sorting requires all compound matches" : null;
 
             if (residualCount == 0)
             {
-                // No residual filter: compound(f1,f2) is walked in ORDER BY order and fills the page itself, after reading the rows an offset
-                // skips, so an offset is priced below
-                if (ctx.BuilderParams.Query.Start == 0)
+                if (canElideCompoundSort && ctx.BuilderParams.Query.Start == 0)
                 {
-                    entriesToScan = Math.Min(drivingCardinality, ctx.BuilderParams.Query.PageSize); // for diagnostics only
+                    entriesToScan = Math.Min(drivingCardinality, ctx.BuilderParams.Query.PageSize);
                     reason = "no residual filter — sorted walk is unconditionally cheaper than build-bitmap-then-sort";
                     return true;
                 }
 
-                // the walk's take, as ConstructCompoundField resolves it: the statistics count the range, so they don't make the walk read it all
-                int take = ResolveSortedScanTake(ctx.BuilderParams, knownTotal: CanResolveKnownTotal(ctx.BuilderParams) ? 0 : -1);
+                int take = canElideCompoundSort
+                    ? ResolveSortedScanTake(ctx.BuilderParams, knownTotal: CanResolveKnownTotal(ctx.BuilderParams) ? 0 : -1)
+                    : global::Corax.Constants.IndexSearcher.TakeAll;
                 entriesToScan = take == global::Corax.Constants.IndexSearcher.TakeAll ? drivingCardinality : Math.Min(drivingCardinality, take);
-                bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher));
-                return IsDirectScanCostEffective(entriesToScan, bitmapCost, entriesToScan, passRate: 1.0, ctx.WantTimings, unboundedReason: null, out reason);
+                if (canElideCompoundSort)
+                    bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher));
+                return IsDirectScanCostEffective(entriesToScan, bitmapCost, entriesToScan, passRate: 1.0, ctx.WantTimings, unboundedReason, out reason);
             }
 
-            // Residual present: read each entry's fields for the residual, may over-scan
-            entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCardinality, ResolveEffectiveScanTake(ctx.BuilderParams), indexSearcher, out long resultsWanted, out double passRate);
-            bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher)); // add the bitmap's survivor-sort cost
-            string unboundedReason = ctx.WantTimings ? DescribeUnboundedScanTake(ctx.BuilderParams) : null;
+            long scanTake = canElideCompoundSort ? ResolveEffectiveScanTake(ctx.BuilderParams) : long.MaxValue;
+            entriesToScan = ComputeNumberOfEntriesQueryLikelyToScan(execs, drivingExec, drivingCardinality, scanTake, indexSearcher, out long resultsWanted, out double passRate);
+            if (canElideCompoundSort)
+                bitmapCost += SurvivorSortCost(EstimateSurvivors(execs, indexSearcher));
+            if (canElideCompoundSort && ctx.WantTimings)
+                unboundedReason = DescribeUnboundedScanTake(ctx.BuilderParams);
             return IsDirectScanCostEffective(entriesToScan, bitmapCost, resultsWanted, passRate, ctx.WantTimings, unboundedReason, out reason);
         }
         

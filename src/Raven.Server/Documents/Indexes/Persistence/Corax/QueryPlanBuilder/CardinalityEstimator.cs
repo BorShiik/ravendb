@@ -169,7 +169,7 @@ internal static class CardinalityEstimator
             return p.ValueType switch
             {
                 PackedParam.TypeLong => EstimateRange(writer.GetLong(p.Param1), isBetween ? writer.GetLong(p.Param2) : 0, long.MinValue, long.MaxValue),
-                PackedParam.TypeDouble => EstimateRange(writer.GetDouble(p.Param1), isBetween ? writer.GetDouble(p.Param2) : 0, double.MinValue, double.MaxValue),
+                PackedParam.TypeDouble => EstimateRange(writer.GetDouble(p.Param1), isBetween ? writer.GetDouble(p.Param2) : 0, double.NegativeInfinity, double.PositiveInfinity),
                 _ => EstimateRange(indexSearcher.EncodeAndApplyAnalyzer(fieldMeta, writer.GetString(p.Param1)),
                     isBetween ? indexSearcher.EncodeAndApplyAnalyzer(fieldMeta, writer.GetString(p.Param2)) : default,
                     Slices.BeforeAllKeys, Slices.AfterAllKeys)
