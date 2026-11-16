@@ -6,9 +6,11 @@ using Corax.Querying.Matches.Meta;
 using Corax.Querying.Matches.SortingMatches.Meta;
 using Corax.Querying.Planning;
 using Corax.Querying.Primitives;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Queries;
 using Voron;
+using RavenConstants = Raven.Client.Constants;
 
 namespace Raven.Server.Documents.Indexes.Persistence.Corax.QueryPlanBuilder;
 
@@ -17,7 +19,8 @@ internal static partial class QueryPlanBuilder
     private static bool CanElideCompoundSort(ref InstantiateContext ctx)
     {
         if (ctx.OrderByFields is not [var sortField] || ctx.Exec.CompoundFieldField2Range is not null ||
-            sortField.FieldType != MatchCompareFieldType.Sequence || HasLegacyCharEncoding(ref ctx))
+            sortField.FieldType != MatchCompareFieldType.Sequence || HasLegacyCharEncoding(ref ctx) ||
+            HasCustomAnalyzer(ref ctx, ctx.Exec.Plan.Template.CompoundFieldSortName))
             return false;
 
         var indexSearcher = ctx.PlanParams.IndexSearcher;
@@ -103,6 +106,23 @@ internal static partial class QueryPlanBuilder
     {
         var terms = indexSearcher.GetTermsFor(field.FieldName);
         return terms is not null && (terms.TryGetValue("false"u8, out _) || terms.TryGetValue("true"u8, out _));
+    }
+
+    private static bool HasCustomAnalyzer(ref InstantiateContext ctx, string fieldName)
+    {
+        var index = ctx.BuilderParams.Index;
+        if (index is null || index.Definition.IndexFields.TryGetValue(fieldName, out IndexField field) == false)
+            return true;
+        if (string.IsNullOrWhiteSpace(field.Analyzer) == false)
+            return true;
+
+        var configuration = index.Configuration;
+        return field.Indexing switch
+        {
+            FieldIndexing.Exact => configuration.DefaultExactAnalyzer != RavenConstants.Documents.Indexing.Analyzers.DefaultExact,
+            FieldIndexing.Search => configuration.DefaultSearchAnalyzer != RavenConstants.Documents.Indexing.Analyzers.DefaultSearch,
+            _ => configuration.DefaultAnalyzer != RavenConstants.Documents.Indexing.Analyzers.Default
+        };
     }
 
     private static bool HasLegacyCharEncoding(ref InstantiateContext ctx) =>

@@ -70,15 +70,16 @@ internal static partial class QueryPlanBuilder
                 var execs = exec.Executions;
                 bool isFullScan = execs is not { Count: > 0 };
                 // the strategy is cached with the plan, but what the sort field's tree covers changes with indexing
-                if (forced is null && isFullScan && orderByFields[0].MayHaveMissingEntries)
+                // The single-key walk drains null and missing in separate runs; only the two-key walk merges them correctly.
+                if (isFullScan && orderByFields[0].MayHaveMissingEntries && (forced is null || orderByFields.Length == 1))
                 {
                     exec.StrategyGateReason = "the sort field's value tree may not reach every document (a direct scan could drop some)";
                     goto default;
                 }
-                // the two-key walk puts a document into the group of the first value it meets, not where the bitmap sorts it
-                if (isFullScan && orderByFields.Length == 2 && ctx.PlanParams.IndexSearcher.HasMultipleTermsInField(orderByFields[0].Field))
+                // The walk places a document in the first primary group it meets, not where the bitmap sorts all its values.
+                if (ctx.PlanParams.IndexSearcher.HasMultipleTermsInField(orderByFields[0].Field))
                 {
-                    exec.StrategyGateReason = "the first sort field holds multiple values per document, so a two-key walk can't place a document by them";
+                    exec.StrategyGateReason = "the first sort field holds multiple values per document, so a sorted walk can't place a document by them";
                     goto default;
                 }
                 string directScanReason = forced is not null ? "forced via $rvn_corax_strategy" : null;
