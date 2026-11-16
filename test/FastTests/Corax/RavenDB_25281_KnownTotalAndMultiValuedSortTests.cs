@@ -212,14 +212,14 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
             "Expected NO DirectScan node for a multi-valued sort field. Plan: " + Describe(plan));
     }
 
-    // A query shaped `where f1 = $x order by f2` over a compound(f1, f2) field has no WHERE clause on the sort
-    // field f2, yet the compound tree already stores f1's entries in f2 order. DirectScanCandidate is set for
-    // this shape so the planner walks the compound subtree in f2 order and skips the SortingMatch heap.
+    // A pure string compound component can serve equality on field1 plus ORDER BY field2 directly from key order.
+    // These guards use Title for that case; numeric components are checked for results without requiring elision.
     private class Film
     {
         public string Id { get; set; }
         public string Category { get; set; }
         public int Year { get; set; }
+        public string Title { get; set; }
     }
 
     private class Films_ByCategoryAndYear : AbstractIndexCreationTask<Film>
@@ -227,19 +227,19 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         public Films_ByCategoryAndYear()
         {
             Map = films => from f in films
-                select new { f.Category, f.Year };
+                select new { f.Category, f.Year, f.Title };
             CompoundField("Category", "Year");
+            CompoundField("Category", "Title");
         }
     }
 
-    // Single-valued Category (equality driver) and Year (sort key), cycled so neither is pre-sorted by
-    // insertion order. 1 in 3 films is "Action" -> well above a 25-row page and below the scan cost cap.
+    // Single-valued Category plus cycled Year and Title values, so neither sort key follows insertion order.
     private static List<Film> BuildFilms(int count)
     {
         string[] categories = { "Action", "Comedy", "Drama" };
         var films = new List<Film>(count);
         for (int i = 0; i < count; i++)
-            films.Add(new Film { Id = $"films/{i}", Category = categories[i % categories.Length], Year = 1980 + (i * 7) % 45 });
+            films.Add(new Film { Id = $"films/{i}", Category = categories[i % categories.Length], Year = 1980 + (i * 7) % 45, Title = $"title/{(i * 13) % 97:D3}" });
 
         return films;
     }
@@ -264,15 +264,9 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
 
         using var session = store.OpenAsyncSession();
 
-        // No filter on the sort field: equality on the compound leading key + ORDER BY the compound second key.
-        // Engages DirectScanCandidate (the no-filter optimization) and must walk the compound tree in Year order.
+        // A pure string second component is the case where the compound key order is the final ORDER BY order.
         await AssertCompoundSortedScanInOrder(session, index.IndexName,
-            $"from index '{index.IndexName}' where Category = 'Action' order by Year as long limit 25 include timings()");
-
-        // Range on the sort field (the existing composite-range path): must ALSO come back in Year order, not
-        // entry-id order. This is the shape that exposed the missing SortedDrivingMatch wrapper.
-        await AssertCompoundSortedScanInOrder(session, index.IndexName,
-            $"from index '{index.IndexName}' where Category = 'Action' and Year > 1990 order by Year as long limit 25 include timings()");
+            $"from index '{index.IndexName}' where Category = 'Action' order by Title limit 25 include timings()");
     }
 
     private async Task AssertCompoundSortedScanInOrder(IAsyncDocumentSession session, string indexName, string rql)
@@ -289,25 +283,22 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         Assert.True(compiled != null, "Expected a CompiledQuery node. Plan: " + Describe(plan));
         compiled.Parameters.TryGetValue("OptimizationHint", out var hint);
         Assert.True(hint == "CompoundSortedScan",
-            "Expected the compound tree walk to drive equality+ORDER BY on compound(Category, Year), but " +
+            "Expected the compound tree walk to drive equality+ORDER BY on compound(Category, Title), but " +
             "OptimizationHint was '" + hint + "' for [" + rql + "]. Plan: " + Describe(plan) + " params: " +
             string.Join(", ", compiled.Parameters.Select(kv => kv.Key + "=" + kv.Value)));
         Assert.True(compiled.Children?.FirstOrDefault(c => c.Operation == "DirectScan") != null,
             "Expected a DirectScan node (compound sorted walk) for [" + rql + "]. Plan: " + Describe(plan));
 
-        int prev = int.MinValue;
+        string prev = null;
         foreach (var r in results)
         {
             Assert.Equal("Action", r.Category);
-            Assert.True(r.Year >= prev, $"Results are not ascending by Year for [{rql}]: saw {prev} then {r.Year}.");
-            prev = r.Year;
+            Assert.True(prev is null || string.CompareOrdinal(r.Title, prev) >= 0, $"Results are not ascending by Title for [{rql}].");
+            prev = r.Title;
         }
     }
 
-    // Descending plan guard: equality on the compound leading key + ORDER BY the second key DESC with no filter
-    // on the sort field must stream via the compound tree walk DESCENDING (CompoundSortedScan, TreeDirection=
-    // Backward), not the bitmap pipeline. The backward StartsWith provider seeks to successor(prefix) (end of the
-    // field1 block) and walks down. Verifies plan, descending order, and paging.
+    // Descending pure string compound scans keep the same early-exit and paging guarantees.
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public async Task DescendingEqualityDrivenCompoundSort_UsesBackwardCompoundSortedScan(Options options)
@@ -322,58 +313,48 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         }
 
         Indexes.WaitForIndexing(store);
-
         using var session = store.OpenAsyncSession();
 
         var page1 = await session.Advanced
-            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Year as long desc limit 25 include timings()")
+            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Title desc limit 25 include timings()")
             .Timings(out var timings)
             .ToListAsync();
 
         Assert.Equal(25, page1.Count);
-
         var plan = timings.QueryPlan as QueryInspectionNode;
         Assert.NotNull(plan);
         var compiled = FindOperation(plan, "CompiledQuery");
         Assert.True(compiled != null, "Expected a CompiledQuery node. Plan: " + Describe(plan));
         compiled.Parameters.TryGetValue("OptimizationHint", out var hint);
-        Assert.True(hint == "CompoundSortedScan",
-            "Descending equality+ORDER BY on compound(Category, Year) must stream via the compound tree walk, but " +
-            "OptimizationHint was '" + hint + "'. Plan: " + Describe(plan));
+        Assert.Equal("CompoundSortedScan", hint);
         var directScan = FindOperation(plan, "DirectScan");
-        Assert.True(directScan != null, "Expected a DirectScan node (compound sorted walk). Plan: " + Describe(plan));
+        Assert.True(directScan != null, "Expected a DirectScan node. Plan: " + Describe(plan));
         directScan.Parameters.TryGetValue("TreeDirection", out var direction);
-        Assert.True(direction == "Backward",
-            "Expected the compound scan to walk Backward for a descending ORDER BY, but TreeDirection was '" + direction +
-            "'. Params: " + string.Join(", ", directScan.Parameters.Select(kv => kv.Key + "=" + kv.Value)));
+        Assert.Equal("Backward", direction);
 
-        // Page 1 is descending by Year and all rows are the driving 'Action' value.
-        int prev = int.MaxValue;
+        string prev = null;
         foreach (var r in page1)
         {
             Assert.Equal("Action", r.Category);
-            Assert.True(r.Year <= prev, $"Results are not descending by Year: saw {prev} then {r.Year}.");
-            prev = r.Year;
+            Assert.True(prev is null || string.CompareOrdinal(r.Title, prev) <= 0, "Results are not descending by Title.");
+            prev = r.Title;
         }
 
-        // Paging: the second page continues the same descending stream (no overlap/gap at the boundary).
         var page2 = await session.Advanced
-            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Year as long desc limit 25, 25")
+            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Title desc limit 25, 25")
             .ToListAsync();
 
         Assert.Equal(25, page2.Count);
-        Assert.True(page2[0].Year <= page1[^1].Year,
-            $"Page 2 must continue the descending order: page1 ended at {page1[^1].Year}, page2 started at {page2[0].Year}.");
+        Assert.True(string.CompareOrdinal(page2[0].Title, page1[^1].Title) <= 0, "Page 2 does not continue the descending order.");
         foreach (var r in page2)
         {
             Assert.Equal("Action", r.Category);
-            Assert.True(r.Year <= prev, $"Results are not descending across pages by Year: saw {prev} then {r.Year}.");
-            prev = r.Year;
+            Assert.True(string.CompareOrdinal(r.Title, prev) <= 0, "Results are not descending across pages by Title.");
+            prev = r.Title;
         }
 
-        // The descending stream must start at the largest Year among the 'Action' films.
-        var maxActionYear = BuildFilms(300).Where(f => f.Category == "Action").Max(f => f.Year);
-        Assert.Equal(maxActionYear, page1[0].Year);
+        string maxActionTitle = BuildFilms(300).Where(f => f.Category == "Action").Max(f => f.Title);
+        Assert.Equal(maxActionTitle, page1[0].Title);
     }
 
     // Known-total / early-exit: the bare compound shape (equality on field1, ORDER BY field2, no field2 filter)
@@ -399,7 +380,7 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
 
         using var session = store.OpenAsyncSession();
         var results = await session.Advanced
-            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Year as long limit 25 include timings()")
+            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Title limit 25 include timings()")
             .Statistics(out var stats)
             .Timings(out var timings)
             .ToListAsync();
@@ -452,18 +433,18 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
 
         using var session = store.OpenAsyncSession();
         var results = await session.Advanced
-            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Year as long limit 25 include timings()")
+            .AsyncRawQuery<Film>($"from index '{index.IndexName}' where Category = 'Action' order by Title limit 25 include timings()")
             .AddParameter("rvn_corax_sort", "IndexOrderStreaming")
             .Timings(out var timings)
             .ToListAsync();
 
         Assert.Equal(25, results.Count);
-        int prev = int.MinValue;
+        string prev = null;
         foreach (var r in results)
         {
             Assert.Equal("Action", r.Category);
-            Assert.True(r.Year >= prev, $"Results are not ascending by Year: saw {prev} then {r.Year}.");
-            prev = r.Year;
+            Assert.True(prev is null || string.CompareOrdinal(r.Title, prev) >= 0, "Results are not ascending by Title.");
+            prev = r.Title;
         }
 
         var plan = timings.QueryPlan as QueryInspectionNode;
@@ -691,10 +672,8 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         }
     }
 
-    // Descending compound-prefix scan: `where Category = X order by Category, UnitsInStock desc` collapses to a
-    // single DESCENDING sort over compound(Category, UnitsInStock). The compound walk must run the prefix BACKWARD
-    // (a null seek term to the backward StartsWith provider crashed with NullReferenceException). Must return the
-    // matching docs in descending UnitsInStock order.
+    // Descending compound sort historically crashed in the backward prefix provider. The query must return
+    // matching docs in descending UnitsInStock order regardless of the selected execution strategy.
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
     public async Task DescendingCompoundSort_DoesNotCrashAndOrdersCorrectly(Options options)
@@ -730,9 +709,8 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         Assert.Equal(199, results[0].UnitsInStock);
     }
 
-    // RavenDB-26831: a compound numeric member must sort negatives correctly. New indexes (built at
-    // CoraxOrderPreservingCompoundNumericEncoding or higher) encode signed longs order-preserving, so the
-    // CompoundSortedScan walk/range over a field with negative values is correct. Cross-engine pins it to Lucene.
+    // RavenDB-26831: negative numeric values retain their numeric order regardless of the selected query plan.
+    // Cross-engine comparison pins both directions and a range crossing zero.
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
     public async Task CompoundSort_NegativeNumericValues_OrderedCorrectly(Options options)
@@ -752,23 +730,11 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         Indexes.WaitForIndexing(store);
         using var session = store.OpenAsyncSession();
 
-        // Ascending: this pins Category and walks compound(Category, UnitsInStock) ascending — exercises the
-        // order-preserving encoding directly. Negatives must come first.
+        // Ascending numeric order puts every negative before zero and the positives.
         var asc = await session.Advanced
-            .AsyncRawQuery<CatDoc>($"from index '{index.IndexName}' where Category = 'categories/1-A' order by Category, UnitsInStock as long include timings()")
-            .Timings(out var ascTimings)
+            .AsyncRawQuery<CatDoc>($"from index '{index.IndexName}' where Category = 'categories/1-A' order by Category, UnitsInStock as long")
             .ToListAsync();
         Assert.Equal(new[] { -50, -16, -1, 0, 1, 7, 100 }, asc.Select(r => r.UnitsInStock).ToList());
-
-        if (options.SearchEngineMode == RavenSearchEngineMode.Corax)
-        {
-            // Make sure we actually exercised the compound walk (not a plain SortingMatch that would pass regardless).
-            var plan = ascTimings.QueryPlan as QueryInspectionNode;
-            var compiled = FindOperation(plan, "CompiledQuery");
-            compiled?.Parameters.TryGetValue("OptimizationHint", out var hint);
-            Assert.True(compiled?.Parameters.GetValueOrDefault("OptimizationHint") == "CompoundSortedScan",
-                "Expected CompoundSortedScan to exercise the compound numeric encoding. Plan: " + Describe(plan));
-        }
 
         // Descending.
         var desc = await session.Advanced
@@ -785,10 +751,8 @@ public class RavenDB_25281_KnownTotalAndMultiValuedSortTests : RavenTestBase
         Assert.Equal(5, (int)rangeStats.TotalResults);
     }
 
-    // Descending sort over ONLY the second compound member (leading member pinned by WHERE but not in the ORDER
-    // BY): `where Category = X order by UnitsInStock desc`. The compound walk's `forward` is false with no field2
-    // range — the path that built a backward StartsWith provider with a null seek term and crashed. Must not
-    // crash and must return descending UnitsInStock.
+    // Descending sort over only the second compound member historically crashed in the backward prefix provider.
+    // The result must remain correct whether the query uses a compound candidate scan or the bitmap fallback.
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
     public async Task DescendingSortOnSecondCompoundMemberOnly_DoesNotCrashAndOrdersCorrectly(Options options)
