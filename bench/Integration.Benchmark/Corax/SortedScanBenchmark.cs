@@ -5,15 +5,17 @@ using BenchmarkDotNet.Attributes;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
+using Sparrow.Utils;
 
 namespace Integration.Benchmark.Corax;
 
-[SimpleJob(warmupCount: 2, iterationCount: 8)]
+[SimpleJob(warmupCount: 5, iterationCount: 20)]
 [MemoryDiagnoser]
 public class SortedScanBenchmark
 {
     private const int NumberOfDocuments = 100_000;
     private RavenDbInstance _instance;
+    private long _nativeBytesAfterSetup;
     private IDocumentStore Store => _instance.Store;
 
     [GlobalSetup]
@@ -59,39 +61,77 @@ public class SortedScanBenchmark
 
         if (isBuilt == false)
             File.WriteAllText(marker, string.Empty);
+
+        _nativeBytesAfterSetup = NativeMemory.TotalAllocatedMemory;
     }
 
     [GlobalCleanup]
-    public void GlobalCleanup() => _instance.Dispose();
+    public void GlobalCleanup()
+    {
+        Console.WriteLine($"Native memory retained delta: {NativeMemory.TotalAllocatedMemory - _nativeBytesAfterSetup} bytes");
+        _instance.Dispose();
+    }
 
     [Benchmark(Baseline = true)]
-    public int StringCompoundAutomatic() => Run("from index 'Items/Compound' where Tag = 'tag1' order by Name limit 50", null);
+    [Arguments(50)]
+    [Arguments(500)]
+    public int StringCompoundAutomatic(int pageSize) => Run($"from index 'Items/Compound' where Tag = 'tag1' order by Name limit {pageSize}", null, pageSize);
 
     [Benchmark]
-    public int StringCompoundBitmap() => Run("from index 'Items/Compound' where Tag = 'tag1' order by Name limit 50", "BitmapPipeline");
+    [Arguments(50)]
+    [Arguments(500)]
+    public int StringCompoundBitmap(int pageSize) => Run($"from index 'Items/Compound' where Tag = 'tag1' order by Name limit {pageSize}", "BitmapPipeline", pageSize);
 
     [Benchmark]
-    public int NumericCompoundAutomatic() => Run("from index 'Items/Compound' where Tag = 'tag1' and Price >= 50000 order by Price as long limit 50", null);
+    [Arguments(50, 10_000)]
+    [Arguments(500, 10_000)]
+    [Arguments(50, 90_000)]
+    [Arguments(500, 90_000)]
+    public int NumericCompoundAutomatic(int pageSize, int lowerBound) => Run(
+        $"from index 'Items/Compound' where Tag = 'tag1' and Price >= {lowerBound} order by Price as long limit {pageSize}", null, pageSize);
 
     [Benchmark]
-    public int NumericCompoundBitmap() => Run("from index 'Items/Compound' where Tag = 'tag1' and Price >= 50000 order by Price as long limit 50", "BitmapPipeline");
+    [Arguments(50, 10_000)]
+    [Arguments(500, 10_000)]
+    [Arguments(50, 90_000)]
+    [Arguments(500, 90_000)]
+    public int NumericCompoundBitmap(int pageSize, int lowerBound) => Run(
+        $"from index 'Items/Compound' where Tag = 'tag1' and Price >= {lowerBound} order by Price as long limit {pageSize}", "BitmapPipeline", pageSize);
 
     [Benchmark]
-    public int NumericCompoundForcedScan() => Run("from index 'Items/Compound' where Tag = 'tag1' and Price >= 50000 order by Price as long limit 50", "CompoundSortedScan");
+    [Arguments(50, 10_000)]
+    [Arguments(500, 10_000)]
+    [Arguments(50, 90_000)]
+    [Arguments(500, 90_000)]
+    public int NumericCompoundForcedScan(int pageSize, int lowerBound) => Run(
+        $"from index 'Items/Compound' where Tag = 'tag1' and Price >= {lowerBound} order by Price as long limit {pageSize}", "CompoundSortedScan", pageSize);
 
     [Benchmark]
-    public int FieldRangeAutomatic() => Run("from index 'Items/ByPrice' where Price > 50000 and Grp < 50 order by Price as long limit 50", null);
+    [Arguments(50, 10_000)]
+    [Arguments(500, 10_000)]
+    [Arguments(50, 90_000)]
+    [Arguments(500, 90_000)]
+    public int FieldRangeAutomatic(int pageSize, int lowerBound) => Run(
+        $"from index 'Items/ByPrice' where Price > {lowerBound} and Grp < 50 order by Price as long limit {pageSize}", null, pageSize);
 
     [Benchmark]
-    public int FieldRangeBitmap() => Run("from index 'Items/ByPrice' where Price > 50000 and Grp < 50 order by Price as long limit 50", "BitmapPipeline");
+    [Arguments(50, 10_000)]
+    [Arguments(500, 10_000)]
+    [Arguments(50, 90_000)]
+    [Arguments(500, 90_000)]
+    public int FieldRangeBitmap(int pageSize, int lowerBound) => Run(
+        $"from index 'Items/ByPrice' where Price > {lowerBound} and Grp < 50 order by Price as long limit {pageSize}", "BitmapPipeline", pageSize);
 
-    private int Run(string rql, string strategy)
+    private int Run(string rql, string strategy, int expectedCount)
     {
         using var session = Store.OpenSession();
         var query = session.Advanced.RawQuery<Item>(rql).NoCaching();
         if (strategy != null)
             query = query.AddParameter("rvn_corax_strategy", strategy);
-        return query.ToList().Count;
+        int count = query.ToList().Count;
+        if (count != expectedCount)
+            throw new InvalidOperationException($"Expected {expectedCount} rows for [{rql}], strategy {strategy ?? "automatic"}, but got {count}.");
+        return count;
     }
 
     public class Item
